@@ -1,0 +1,6 @@
+streamlit
+langgraph
+requests
+pyodbc
+rapidfuzz
+python-dotenv
