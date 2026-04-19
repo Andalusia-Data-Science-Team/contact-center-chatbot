@@ -20,7 +20,7 @@ git push origin main
 # Step 2: Pull on server + restart
 echo ""
 echo "🖥️  Updating server..."
-ssh -i "$KEY" "$SERVER" "cd $PROJECT && git pull origin main && source venv/bin/activate && pip install -r requirements.txt -q && sudo systemctl restart andalusia-bot && echo '✅ Bot restarted successfully'"
+ssh -i "$KEY" "$SERVER" "cd $PROJECT && git pull origin main && if [ -f venv/bin/activate ]; then source venv/bin/activate && pip install -r requirements.txt -q; fi && sudo systemctl restart andalusia-bot && echo '✅ Bot restarted successfully'"
 
 echo ""
 echo "══════════════════════════════════════"
