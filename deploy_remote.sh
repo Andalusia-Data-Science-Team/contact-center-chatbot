@@ -6,7 +6,7 @@ set -e
 
 SERVER="ai@10.24.105.220"
 KEY="$HOME/.ssh/deploy_key"
-PROJECT="/home/ai/Workspace/Alia/Booking_bot_latest"
+PROJECT="/home/ai/Workspace/Alia/contact-center-chatbot"
 
 echo "══════════════════════════════════════"
 echo "  Deploying Andalusia Booking Bot"
