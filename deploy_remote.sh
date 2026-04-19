@@ -20,11 +20,16 @@ git push origin main
 # Step 2: Pull on server + restart
 echo ""
 echo "🖥️  Updating server..."
-ssh -i "$KEY" "$SERVER" "cd $PROJECT && git pull origin main && if [ -f venv/bin/activate ]; then source venv/bin/activate && pip install -r requirements.txt -q; fi && sudo systemctl restart andalusia-bot && echo '✅ Bot restarted successfully'"
+ssh -i "$KEY" "$SERVER" "cd $PROJECT && git pull origin main && if [ -f venv/bin/activate ]; then source venv/bin/activate && pip install -r requirements.txt -q; fi"
+
+# Try to restart the service (may need sudo password)
+echo ""
+echo "🔄 Restarting bot service..."
+ssh -i "$KEY" "$SERVER" "sudo systemctl restart andalusia-bot 2>/dev/null && echo '✅ Bot restarted' || echo '⚠️  Could not restart automatically. Run on server: sudo systemctl restart andalusia-bot'"
 
 echo ""
 echo "══════════════════════════════════════"
-echo "✅ Deploy complete!"
+echo "✅ Code deployed!"
 echo "🌐 Bot: http://10.24.105.220:8502"
 echo "📊 Logs: http://10.24.105.220:8502/logs"
 echo "══════════════════════════════════════"
