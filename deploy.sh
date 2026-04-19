@@ -100,7 +100,7 @@ After=network.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=$BOT_DIR
-ExecStart=$BOT_DIR/venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+ExecStart=$BOT_DIR/venv/bin/streamlit run app.py --server.port 8502 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -124,7 +124,7 @@ if sudo systemctl is-active --quiet andalusia-bot; then
     echo ""
     echo "🌐 Share this URL with your team:"
     echo ""
-    echo "   http://$SERVER_IP:8501"
+    echo "   http://$SERVER_IP:8502"
     echo ""
     echo "═══════════════════════════════════════════════════"
     echo ""

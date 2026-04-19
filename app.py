@@ -7,6 +7,7 @@ from state import initial_state
 from graph import compiled_graph
 from config.settings import VIEW_MODE, LLM_INPUT_PRICE_PER_M, LLM_OUTPUT_PRICE_PER_M
 from llm.client import reset_turn_metrics, get_turn_metrics
+from db.logger import create_session, log_turn
 
 
 # ── Page Config ─────────────────────────────────────────────────────────────
@@ -111,6 +112,9 @@ if "chat_display" not in st.session_state:
 if "is_typing" not in st.session_state:
     st.session_state.is_typing = False
 
+if "session_id" not in st.session_state:
+    st.session_state.session_id = create_session()
+
 if "view_mode" not in st.session_state:
     st.session_state.view_mode = VIEW_MODE  # Initialize from settings.py default
 
@@ -145,6 +149,7 @@ with reset_col:
         st.session_state.bot_state = initial_state()
         st.session_state.chat_display = []
         st.session_state.is_typing = False
+        st.session_state.session_id = create_session()
         st.rerun()
 
 # ── Status Messages ───────────────────────────────────────────────────────────
@@ -320,6 +325,19 @@ if st.session_state.is_typing:
             st.session_state.chat_display.append(
                 {"role": "assistant", "content": bot_reply}
             )
+
+        # ── Log turn to SQLite ──
+        try:
+            log_turn(
+                session_id=st.session_state.session_id,
+                turn_number=result.get("_session_turns", 1),
+                user_message=last_user_msg,
+                bot_reply=bot_reply,
+                turn_metrics=turn_metrics,
+                state=result,
+            )
+        except Exception:
+            pass  # logging should never break the bot
 
         # Show followup message as a separate bubble (e.g., app download prompt)
         followup = (result.get("followup_message") or "").strip()
