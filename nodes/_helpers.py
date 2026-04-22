@@ -4,6 +4,7 @@ Shared utilities for LangGraph nodes.
 Centralizes state update logic so every node applies updates consistently.
 """
 from utils.datetime_fmt import resolve_relative_date
+from utils.language import normalize_ar
 
 
 def apply_llm_updates(state: dict, updates: dict) -> None:
@@ -50,6 +51,21 @@ def apply_llm_updates(state: dict, updates: dict) -> None:
     if state.get("insured") is True and not state.get("insurance_company"):
         _try_match_insurance_from_message(state)
 
+    # Populate walk-in (cash) price once per doctor. Track the name we looked up
+    # so switching doctors forces a fresh lookup.
+    doc_en = state.get("doctor")
+    if doc_en and state.get("_walk_in_price_doctor") != doc_en:
+        try:
+            from services.doctor_price import get_walk_in_price
+            state["walk_in_price"] = get_walk_in_price(doc_en)
+        except Exception:
+            state["walk_in_price"] = None
+        state["_walk_in_price_doctor"] = doc_en
+        if state["walk_in_price"] is None:
+            print(f"[price] {doc_en!r}: NO walk-in fee on file — will promise callback")
+        else:
+            print(f"[price] {doc_en!r}: walk-in = {state['walk_in_price']}")
+
 
 def get_last_user_message(state: dict) -> str | None:
     """Extract the latest user message from the conversation."""
@@ -58,14 +74,16 @@ def get_last_user_message(state: dict) -> str | None:
     return user_messages[-1]["content"] if user_messages else None
 
 
-# Expanded acceptance words based on real Andalusia chat patterns
+# Acceptance words — all stored normalized (no hamza, ta-marbuta unified).
+# User input is normalized with the same rules before matching, so Saudi
+# variants like "أيوه" match "ايوه" after normalization.
 ACCEPTANCE_WORDS = {
     "yes", "ok", "okay", "sure", "fine", "great", "perfect", "works", "good",
     "that works", "yes please", "sounds good", "that's fine", "confirmed",
     "confirm", "yep", "yup", "yeah", "alright",
     "نعم", "اوك", "موافق", "تمام", "زين", "ماشي", "اكيد", "ايوه", "ايه",
-    "أكيد", "ابشر", "مناسب", "يناسبني", "كويس", "حلو", "طيب",
-    "ان شاء الله", "إن شاء الله", "ان شاءالله",
+    "ابشر", "مناسب", "يناسبني", "كويس", "حلو", "طيب",
+    "ان شاء الله", "ان شاءالله",
 }
 
 ACCEPTANCE_PARTIAL = {"yes", "ok", "sure", "نعم", "تمام", "زين", "ماشي", "مناسب", "طيب", "ايوه"}
@@ -75,7 +93,7 @@ def is_acceptance(text: str) -> bool:
     """True if the patient accepted a shown option rather than requesting something different."""
     if not text:
         return False
-    t = text.strip().lower()
+    t = normalize_ar(text)
     if t in ACCEPTANCE_WORDS:
         return True
     return len(t.split()) <= 3 and any(w in t for w in ACCEPTANCE_PARTIAL)

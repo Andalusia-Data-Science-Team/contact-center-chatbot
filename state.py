@@ -37,6 +37,10 @@ class BookingState(TypedDict):
     insured: Optional[bool]
     insurance_company: Optional[str]
 
+    walk_in_price: Optional[float]          # Cash price for the selected doctor (from CRM)
+    _walk_in_price_doctor: Optional[str]    # Tracks which doctor the price was fetched for
+    _pending_price_followup: Optional[bool] # True after asking "cash or insurance?" for price context
+
     booking_stage: Optional[str]
     last_bot_message: Optional[str]
     followup_message: Optional[str]     # Second message sent after the main reply (e.g., app download prompt)
@@ -80,6 +84,9 @@ def initial_state() -> BookingState:
         phone=None,
         insured=None,
         insurance_company=None,
+        walk_in_price=None,
+        _walk_in_price_doctor=None,
+        _pending_price_followup=False,
         booking_stage=None,
         last_bot_message=None,
         followup_message=None,

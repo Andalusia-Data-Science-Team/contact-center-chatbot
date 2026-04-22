@@ -14,6 +14,17 @@ DB_DATABASE = os.getenv("DB_DATABASE", "")
 DB_USERNAME = os.getenv("DB_USERNAME", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
+# --- Dynamics 365 CRM (doctor reference data incl. walk-in / cash price) ---
+# Accessed via the CRM TDS endpoint (SQL protocol) with Azure AD auth.
+CRM_SERVER = os.getenv("CRM_SERVER", "")                 # e.g. "org2f45e702.crm4.dynamics.com,5558"
+CRM_CLIENT_ID = os.getenv("CRM_CLIENT_ID", "51f81489-12ee-4a9e-aaae-a2591f45987d")
+CRM_TENANT = os.getenv("CRM_TENANT", "organizations")
+CRM_USERNAME = os.getenv("CRM_USERNAME", "")
+CRM_PASSWORD = os.getenv("CRM_PASSWORD", "")
+CRM_DOCTOR_TABLE = os.getenv("CRM_DOCTOR_TABLE", "dbo.cr301_newdoctordataset")
+CRM_FEE_TABLE = os.getenv("CRM_FEE_TABLE", "dbo.cr301_table1")
+CRM_PRICE_CACHE_TTL_SECONDS = int(os.getenv("CRM_PRICE_CACHE_TTL_SECONDS", "86400"))  # 24h
+
 # --- Thresholds ---
 ROUTING_CONFIDENCE_THRESHOLD = 0.65
 INTENT_SWITCH_CONFIDENCE_THRESHOLD = 0.85

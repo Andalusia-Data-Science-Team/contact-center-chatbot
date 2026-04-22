@@ -41,10 +41,20 @@ def _try_direct_parse(raw: str) -> Optional[datetime.time]:
     since appointments are virtually never at 1-7 AM.
     """
     import re
-    text = raw.strip()
+    from utils.language import to_ascii_digits
+    text = to_ascii_digits(raw).strip().lower()
+
+    # Normalise Arabic period suffixes to canonical am/pm BEFORE the regex stage.
+    # "٨ مساء"/"8 مساءً"/"8 م" → "8 pm"
+    # "8 صباحاً"/"8 ص" → "8 am"
+    text = re.sub(r'\s*مساء[ًاٍ]?\s*$', ' pm', text)
+    text = re.sub(r'\s*صباحا?[ًا]?\s*$', ' am', text)
+    text = re.sub(r'(\d)\s*م\s*$', r'\1 pm', text)
+    text = re.sub(r'(\d)\s*ص\s*$', r'\1 am', text)
+    text = text.strip()
 
     # Match "3:00 PM", "03:00 pm", "3:00PM" — explicit AM/PM
-    m = re.match(r'^(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)$', text)
+    m = re.match(r'^(\d{1,2}):(\d{2})\s*(am|pm)$', text)
     if m:
         h, mi, period = int(m.group(1)), int(m.group(2)), m.group(3).upper()
         if period == "PM" and h != 12:
@@ -55,7 +65,7 @@ def _try_direct_parse(raw: str) -> Optional[datetime.time]:
             return datetime(2000, 1, 1, h, mi).time()
 
     # Match "3 PM", "3PM" — explicit AM/PM
-    m = re.match(r'^(\d{1,2})\s*(am|pm|AM|PM)$', text)
+    m = re.match(r'^(\d{1,2})\s*(am|pm)$', text)
     if m:
         h, period = int(m.group(1)), m.group(2).upper()
         if period == "PM" and h != 12:

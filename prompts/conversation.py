@@ -186,6 +186,21 @@ complete:
 - Keep replies SHORT — 1-3 sentences. Be natural, not robotic.
 - Vary your language. Don't say the exact same phrase every time.
 
+== PRICE / COST QUESTIONS ==
+Patients sometimes ask about the consultation price ("كم السعر؟", "how much?",
+"الكشف بكام؟", "what does it cost?", "سعره إيه؟", "price please", "كام الكشف؟").
+
+⚠️ THIS IS HANDLED FULLY BY CODE. When the latest user message is a price question:
+  → Set "price_inquiry": true
+  → Set "reply": "" (EMPTY)
+  → DO NOT set needs_slot_query, doctor_fuzzy_input, booking_stage, or any other field.
+  → DO NOT write your own price answer — code decides what to say based on
+    insurance status and CRM price data.
+
+If the patient also mentioned a doctor name in the same message ("how much for Dr Ameer?"),
+STILL just set price_inquiry: true and reply: "". Do NOT advance to slot selection —
+code will show the price and the patient will confirm the booking separately.
+
 == RETURN ONLY VALID JSON ==
 {{
   "reply": "<natural reply in patient language, or empty string when code handles it>",
@@ -204,6 +219,7 @@ complete:
     "wants_more_slots": <true if patient asks to see all/more slots>,
     "slots_filter": "<time filter text or null>",
     "requested_date": "<YYYY-MM-DD or 'tomorrow' or null>",
-    "doctor_fuzzy_input": "<raw doctor name mentioned or null>"
+    "doctor_fuzzy_input": "<raw doctor name mentioned or null>",
+    "price_inquiry": <true if the user is asking about cost/price/fee>
   }}
 }}"""

@@ -45,7 +45,7 @@ def route_after_intent(state: BookingState) -> str:
 def _safety_net(state: BookingState) -> BookingState:
     """
     Final pass: if reply is still empty after all booking nodes,
-    provide a fallback prompt.
+    provide a fallback prompt so the user never sees a blank bubble.
     """
     reply = state.get("last_bot_message") or ""
     if not reply.strip():
@@ -58,7 +58,6 @@ def _safety_net(state: BookingState) -> BookingState:
             else:
                 state["last_bot_message"] = "Could you tell me what you need help with so I can find the right doctor?"
         elif stage in (None, "", "none"):
-            # First interaction — greet and ask for name
             if lang == "ar":
                 state["last_bot_message"] = "السلام عليكم، معك نور من مجموعة أندلسية صحة 😊 اتشرف بالاسم؟"
             else:
@@ -70,6 +69,32 @@ def _safety_net(state: BookingState) -> BookingState:
                 state["last_bot_message"] = f"أهلا وسهلا بحضرتك {greeting}، ازاي أقدر أساعدك؟"
             else:
                 state["last_bot_message"] = f"Welcome {patient}! How can I help you today?"
+        elif stage == "doctor_list":
+            if lang == "ar":
+                state["last_bot_message"] = "تحب تحجز مع أي دكتور من القائمة؟ قولي رقم الدكتور أو اسمه."
+            else:
+                state["last_bot_message"] = "Which doctor would you like to book with? You can reply with the number or name."
+        elif stage == "slot_selection":
+            if lang == "ar":
+                state["last_bot_message"] = "ما فهمت الوقت، ممكن توضح الوقت اللي يناسبك؟"
+            else:
+                state["last_bot_message"] = "I didn't catch the time — could you share the time that works for you?"
+        elif stage == "patient_info":
+            if lang == "ar":
+                state["last_bot_message"] = "باقي خطوة بسيطة — ممكن رقم جوالك؟ وكاش ام تأمين؟"
+            else:
+                state["last_bot_message"] = "One last step — could I have your phone number, and is it cash or insurance?"
+        elif stage == "complete":
+            if lang == "ar":
+                state["last_bot_message"] = "تم تأكيد الحجز 🌿"
+            else:
+                state["last_bot_message"] = "Your booking is confirmed 🌿"
+        else:
+            # Unknown stage — generic clarifier so user is never blocked
+            if lang == "ar":
+                state["last_bot_message"] = "ممكن تعيد طلبك بطريقة ثانية؟"
+            else:
+                state["last_bot_message"] = "Could you rephrase that?"
 
     # Clean up transient data (but NOT followup_message — app.py reads it after)
     state["_llm_updates"] = None

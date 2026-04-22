@@ -155,6 +155,17 @@ def doctor_confirm_message(matched_name: str, lang: str) -> str:
 
 
 def doctor_not_found_message(specialty: str, lang: str) -> str:
+    # When specialty is missing (Path C before routing), don't render the word "None"
+    if not specialty:
+        if lang == "ar":
+            return (
+                "للأسف ما قدرت ألاقي الدكتور المطلوب. "
+                "ممكن توضحلي وش التخصص أو نوع الكشف المطلوب؟"
+            )
+        return (
+            "Sorry, I couldn't find that doctor. "
+            "Could you tell me the specialty or what kind of appointment you need?"
+        )
     spec_name = _spec_display(specialty, lang)
     if lang == "ar":
         return f"ما لقيت الاسم ده في قائمة أطباء **{spec_name}**. ممكن تختار رقم الطبيب من القائمة؟"
@@ -181,6 +192,105 @@ def missing_info_message(missing: list, lang: str) -> str:
     return f"I just need {fields} to complete your booking."
 
 
+def _format_price(amount: float, lang: str) -> str:
+    if lang == "ar":
+        from utils.datetime_fmt import _to_arabic_numerals
+        return _to_arabic_numerals(f"{amount:g}")
+    return f"{amount:g}"
+
+
+def _price_line(state: dict, lang: str) -> str:
+    """Walk-in price line shown only to cash / self-pay patients."""
+    if state.get("insured"):
+        return ""
+    price = state.get("walk_in_price")
+    if price is None:
+        return ""
+    try:
+        amount = float(price)
+    except (TypeError, ValueError):
+        return ""
+    if lang == "ar":
+        return f"\n💵 سعر الكشف (كاش): {_format_price(amount, lang)}"
+    return f"\n💵 Consultation fee (cash): {_format_price(amount, lang)}"
+
+
+# ── Price inquiry responses ───────────────────────────────────────────────────
+
+def price_insured_message(lang: str) -> str:
+    if lang == "ar":
+        return (
+            "التأمين يغطي الكشف إن شاء الله. "
+            "أي فرق بسيط (لو وُجد) يتأكد منه الاستقبال عند الحضور."
+        )
+    return (
+        "Your insurance covers the consultation — any co-pay, if applicable, "
+        "is confirmed at the reception."
+    )
+
+
+def price_cash_message(doctor_en: str, doctor_ar: str, amount: float, lang: str) -> str:
+    doc = (doctor_ar or doctor_en) if lang == "ar" else doctor_en
+    prefix = "د. " if lang == "ar" else "Dr. "
+    amt = _format_price(amount, lang)
+    if lang == "ar":
+        return f"سعر الكشف كاش لـ {prefix}{doc} هو **{amt}**."
+    return f"The cash consultation fee with {prefix}{doc} is **{amt}**."
+
+
+def price_unknown_insurance_message(doctor_en: str, doctor_ar: str, amount, lang: str) -> str:
+    """Asked about price before telling us insurance — answer + clarify."""
+    doc = (doctor_ar or doctor_en) if lang == "ar" else doctor_en
+    prefix = "د. " if lang == "ar" else "Dr. "
+    if amount is not None:
+        amt = _format_price(float(amount), lang)
+        if lang == "ar":
+            return (
+                f"سعر الكشف كاش لـ {prefix}{doc} هو **{amt}**. "
+                f"هل الدفع كاش أم عندك تأمين؟"
+            )
+        return (
+            f"The cash consultation fee with {prefix}{doc} is **{amt}**. "
+            f"Will it be cash or do you have insurance?"
+        )
+    # No price on file — still ask cash/insurance so we know the billing path
+    if lang == "ar":
+        return (
+            "السعر بيختلف حسب طريقة الدفع. هل الدفع كاش أم عندك تأمين؟ "
+            "لو تأمين، التأمين يغطي الكشف."
+        )
+    return (
+        "The price depends on billing. Is it cash or do you have insurance? "
+        "If insured, your insurance covers the consultation."
+    )
+
+
+def price_no_data_message(doctor_en: str, doctor_ar: str, lang: str) -> str:
+    doc = (doctor_ar or doctor_en) if lang == "ar" else doctor_en
+    prefix = "د. " if lang == "ar" else "Dr. "
+    if lang == "ar":
+        return (
+            f"سعر الكشف كاش لـ {prefix}{doc} مش متاح عندي حالياً، "
+            f"بس هنتواصل معاك ونبلغك بالسعر في أقرب وقت."
+        )
+    return (
+        f"I don't have the cash price for {prefix}{doc} on file right now — "
+        f"our team will contact you shortly with it."
+    )
+
+
+def price_no_doctor_message(lang: str) -> str:
+    if lang == "ar":
+        return (
+            "السعر بيختلف من دكتور للتاني. لو تحب، اختار الدكتور من القائمة "
+            "وأقدر أطلعلك السعر بالظبط."
+        )
+    return (
+        "Prices vary by doctor. Pick a doctor from the list and I can share the "
+        "exact cash fee."
+    )
+
+
 def confirmation_message(state: dict, lang: str) -> str:
     doc_en = state.get("doctor", "")
     doc_ar = state.get("doctor_ar", "")
@@ -199,6 +309,7 @@ def confirmation_message(state: dict, lang: str) -> str:
     insured = state.get("insured")
     insurance = state.get("insurance_company", "")
     prefix = "د. " if lang == "ar" else "Dr. "
+    price_line = _price_line(state, lang)
 
     if lang == "ar":
         ins_text = insurance if (insured and insurance) else "تأمين" if insured else "كاش"
@@ -209,7 +320,8 @@ def confirmation_message(state: dict, lang: str) -> str:
             f"🏥 عيادة {spec}\n"
             f"📅 يوم {appt_date}\n"
             f"🕐 الساعة {slot_display}\n"
-            f"💳 {ins_text}\n\n"
+            f"💳 {ins_text}"
+            f"{price_line}\n\n"
             f"واستأذنك الحضور قبل الميعاد بـ **ربع ساعة** لاستكمال إجراءات الحجز مع الاستقبال.\n\n"
             f"اي استفسار آخر أقدر أساعدك به؟ 😊\n"
             f"نور — مجموعة أندلسية صحة"
@@ -223,7 +335,8 @@ def confirmation_message(state: dict, lang: str) -> str:
         f"🏥 {spec}\n"
         f"📅 {appt_date}\n"
         f"🕐 {slot_display}\n"
-        f"💳 {ins_text}\n\n"
+        f"💳 {ins_text}"
+        f"{price_line}\n\n"
         f"Please arrive **15 minutes** early to complete check-in at reception.\n\n"
         f"Is there anything else I can help with? 😊\n"
         f"Nour — Andalusia Health Group"

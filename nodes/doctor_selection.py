@@ -9,7 +9,7 @@ from services.formatter import (
     slot_question, doctor_confirm_message,
     doctor_not_found_message,
 )
-from utils.datetime_fmt import format_date
+from utils.datetime_fmt import format_date, format_time
 
 
 def doctor_selection_node(state: BookingState) -> BookingState:
@@ -37,6 +37,11 @@ def doctor_selection_node(state: BookingState) -> BookingState:
 
 
 def _handle_doctor_match(raw_input: str, state: dict, lang: str) -> str:
+    # Path C: patient named a doctor directly without prior specialty routing.
+    # No doctor list loaded yet — query the DB directly by doctor name.
+    if not state.get("available_doctors"):
+        return _handle_direct_doctor_lookup(raw_input, state, lang)
+
     m = match_doctor(raw_input, state.get("available_doctors", []))
     specialty = state.get("speciality") or state.get("speciality_ar", "")
 
@@ -44,6 +49,7 @@ def _handle_doctor_match(raw_input: str, state: dict, lang: str) -> str:
         doc = m["doctor"]
         state["doctor"] = doc.get("Doctor", "")
         state["doctor_ar"] = doc.get("DoctorAR", "")
+        state["walk_in_price"] = doc.get("WalkInPrice")
         return _handle_slot_fetch(state, lang)
 
     if m["status"] == "confirm":
@@ -51,6 +57,53 @@ def _handle_doctor_match(raw_input: str, state: dict, lang: str) -> str:
         return doctor_confirm_message(m.get("matched_name", ""), lang)
 
     return doctor_not_found_message(specialty, lang)
+
+
+def _handle_direct_doctor_lookup(raw_input: str, state: dict, lang: str) -> str:
+    """
+    Path C: resolve a doctor name globally by querying availability across all
+    specialties. Populates state["doctor"]/["doctor_ar"]/["speciality"] and then
+    fetches their slots.
+    """
+    from db.database import query_availability_with_fallback, aggregate_doctor_slots
+    from services.doctor_price import enrich_doctors_with_prices
+
+    raw = (raw_input or "").strip()
+    # Strip common Arabic prefixes that aren't part of the name
+    for prefix in ("د. ", "د.", "د ", "دكتور ", "الدكتور ", "Dr. ", "Dr.", "Dr "):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+            break
+
+    if not raw:
+        return doctor_not_found_message(None, lang)
+
+    # Try EN name first, then AR
+    rows, used_date = query_availability_with_fallback(doctor_en=raw)
+    if not rows:
+        rows, used_date = query_availability_with_fallback(doctor_ar=raw)
+
+    if not rows:
+        return doctor_not_found_message(None, lang)
+
+    doctors = aggregate_doctor_slots(rows)
+    if not doctors:
+        return doctor_not_found_message(None, lang)
+
+    enrich_doctors_with_prices(doctors)
+
+    # Take the first match (DB query already filtered by exact name)
+    doc = doctors[0]
+    state["doctor"] = doc.get("Doctor", "")
+    state["doctor_ar"] = doc.get("DoctorAR", "")
+    state["speciality"] = doc.get("Specialty", "") or state.get("speciality")
+    state["speciality_ar"] = doc.get("SpecialtyAR", "") or state.get("speciality_ar")
+    state["specialty_confirmed"] = True
+    state["date"] = used_date
+    state["available_doctors"] = doctors
+    state["walk_in_price"] = doc.get("WalkInPrice")
+
+    return _handle_slot_fetch(state, lang)
 
 
 def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> str:
@@ -76,6 +129,16 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
 
     slot_info = get_initial_slots(slots)
     state["booking_stage"] = "slot_selection"
+    # Mark the displayed earliest slot as a proposal so any acceptance reply —
+    # including one combined with another question (e.g. a price inquiry) —
+    # can confirm it deterministically without going back through the LLM.
+    first_time = slot_info["first_time"]
+    state["_proposed_slot"] = {
+        "time_24": first_time.strftime("%H:%M"),
+        "time_display": format_time(first_time, lang),
+        "date": slot_info["first_date"].strftime("%Y-%m-%d"),
+        "date_display": format_date(slot_info["first_date"], lang),
+    }
     return slot_question(state["doctor"], state.get("doctor_ar", ""), slot_info, lang)
 
 

@@ -9,6 +9,7 @@ from db.database import (
     query_doctor_slots_with_fallback,
     aggregate_doctor_slots,
 )
+from services.doctor_price import enrich_doctors_with_prices
 from utils.fuzzy_match import fuzzy_match_doctor
 
 NAME_STOPWORDS = {
@@ -36,6 +37,7 @@ def fetch_doctors(specialty: str, lang: str, preferred_date: str = None) -> tupl
 
     doctors = aggregate_doctor_slots(rows)
     doctors = [d for d in doctors if d.get("Nearest_Date") and d.get("Nearest_Time")]
+    enrich_doctors_with_prices(doctors)
     return doctors, used_date
 
 

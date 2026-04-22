@@ -4,3 +4,4 @@ requests
 pyodbc
 rapidfuzz
 python-dotenv
+msal

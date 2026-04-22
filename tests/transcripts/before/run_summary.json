@@ -1,0 +1,119 @@
+[
+  {
+    "name": "A1_symptom_cardiology",
+    "description": "Path A: symptoms (chest pain + cough) → cardiology routing",
+    "final_stage": "doctor_list",
+    "selected_slot": null,
+    "doctor": null,
+    "speciality": "Chest",
+    "phone": "0501234567",
+    "insured": true,
+    "insurance_company": "Bupa",
+    "errors": [
+      "turn 8: empty bot reply",
+      "turn 11: empty bot reply"
+    ],
+    "total_turns_run": 11,
+    "total_calls": 17,
+    "total_tokens": 38257,
+    "transcript_path": "tests\\transcripts\\A1_symptom_cardiology.md"
+  },
+  {
+    "name": "A2_vague_symptom",
+    "description": "Path A: vague complaint requiring clarification",
+    "final_stage": "doctor_list",
+    "selected_slot": null,
+    "doctor": null,
+    "speciality": "Neurology",
+    "phone": "0555123456",
+    "insured": false,
+    "insurance_company": null,
+    "errors": [
+      "turn 11: empty bot reply"
+    ],
+    "total_turns_run": 11,
+    "total_calls": 19,
+    "total_tokens": 37525,
+    "transcript_path": "tests\\transcripts\\A2_vague_symptom.md"
+  },
+  {
+    "name": "B1_named_specialty_eye",
+    "description": "Path B: patient names specialty directly (ophthalmology)",
+    "final_stage": "doctor_list",
+    "selected_slot": null,
+    "doctor": null,
+    "speciality": "Ophthalmology",
+    "phone": "0533445566",
+    "insured": true,
+    "insurance_company": "التعاونية",
+    "errors": [
+      "turn 7: empty bot reply",
+      "turn 8: empty bot reply",
+      "turn 10: empty bot reply",
+      "turn 11: empty bot reply"
+    ],
+    "total_turns_run": 11,
+    "total_calls": 16,
+    "total_tokens": 36701,
+    "transcript_path": "tests\\transcripts\\B1_named_specialty_eye.md"
+  },
+  {
+    "name": "B2_dental_urgent",
+    "description": "Path B: dental with urgency + Saudi slang",
+    "final_stage": "doctor_list",
+    "selected_slot": null,
+    "doctor": null,
+    "speciality": "Dental Services",
+    "phone": "0566778899",
+    "insured": false,
+    "insurance_company": null,
+    "errors": [
+      "turn 6: empty bot reply",
+      "turn 7: empty bot reply",
+      "turn 8: empty bot reply",
+      "turn 10: empty bot reply"
+    ],
+    "total_turns_run": 10,
+    "total_calls": 13,
+    "total_tokens": 32842,
+    "transcript_path": "tests\\transcripts\\B2_dental_urgent.md"
+  },
+  {
+    "name": "C1_named_doctor",
+    "description": "Path C: patient names doctor directly with preferred time",
+    "final_stage": "slot_selection",
+    "selected_slot": null,
+    "doctor": "د. ولاء السعدني",
+    "speciality": null,
+    "phone": "0544332211",
+    "insured": true,
+    "insurance_company": "Medgulf",
+    "errors": [],
+    "total_turns_run": 8,
+    "total_calls": 10,
+    "total_tokens": 26363,
+    "transcript_path": "tests\\transcripts\\C1_named_doctor.md"
+  },
+  {
+    "name": "C2_change_mind",
+    "description": "Patient changes mind mid-flow (switch specialty)",
+    "final_stage": "slot_selection",
+    "selected_slot": null,
+    "doctor": "Abdulrahman Ahmad",
+    "speciality": "Dermatology and Cosmatology",
+    "phone": "0577112233",
+    "insured": true,
+    "insurance_company": "AXA",
+    "errors": [
+      "turn 7: empty bot reply",
+      "turn 8: empty bot reply",
+      "turn 9: empty bot reply",
+      "turn 10: empty bot reply",
+      "turn 11: empty bot reply"
+    ],
+    "total_turns_run": 12,
+    "total_calls": 16,
+    "total_tokens": 39967,
+    "transcript_path": "tests\\transcripts\\C2_change_mind.md"
+  }
+]

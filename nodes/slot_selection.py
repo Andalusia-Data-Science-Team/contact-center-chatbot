@@ -82,6 +82,10 @@ def slot_selection_node(state: BookingState) -> BookingState:
                 )
         else:
             filter_label = time_filter.get("label", "")
+            # The initial "nearest slot" proposal no longer reflects what the
+            # patient is looking at — clear it so a later acceptance doesn't
+            # silently lock the stale slot.
+            state["_proposed_slot"] = None
             state["last_bot_message"] = more_slots_message(
                 state["doctor"], state.get("doctor_ar", ""), all_slots, lang,
                 filter_label=filter_label,
@@ -294,6 +298,13 @@ _TIME_PERIOD_KEYWORDS = {
     "tonight", "evening", "morning", "afternoon", "night", "this evening",
     "الليلة", "المساء", "مساء", "الصبح", "بعد الظهر", "العصر", "بعد العصر",
     "الليل", "صباح",
+    # Saudi prayer-time references (very common as rough time anchors)
+    "المغرب", "بعد المغرب", "الفجر", "الظهر", "بعد الظهر", "العشاء", "بعد العشاء",
+}
+
+# "Today" / "tomorrow" in Saudi dialect — handled as requested_date, not time filter
+_RELATIVE_DATE_KEYWORDS = {
+    "today", "tomorrow", "اليوم", "بكرا", "بكره", "بكرة", "غدا", "غداً",
 }
 
 _TIME_INDICATORS = {
@@ -301,8 +312,15 @@ _TIME_INDICATORS = {
 }
 
 import re
-_TIME_PATTERN = re.compile(r'\b(?:at|after|around|before|بعد|قبل|حوالي|الساعة)\s*\d{1,2}', re.IGNORECASE)
-_BARE_TIME_PATTERN = re.compile(r'\b\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)\b')
+# Accept both ASCII and Arabic-Indic digits (٠-٩ are U+0660..U+0669)
+_DIGIT_CLASS = r'[\d\u0660-\u0669]'
+_TIME_PATTERN = re.compile(
+    rf'\b(?:at|after|around|before|بعد|قبل|حوالي|الساعة)\s*{_DIGIT_CLASS}{{1,2}}',
+    re.IGNORECASE,
+)
+_BARE_TIME_PATTERN = re.compile(
+    rf'\b{_DIGIT_CLASS}{{1,2}}(?::{_DIGIT_CLASS}{{2}})?\s*(?:am|pm|AM|PM|ص|م|صباحا|صباحاً|مساء|مساءً)\b'
+)
 
 
 def _slot_safety_net(state: dict, updates: dict) -> dict:
@@ -311,6 +329,12 @@ def _slot_safety_net(state: dict, updates: dict) -> dict:
     clearly contains a time request, fix the updates so the slot_selection logic fires.
     """
     from nodes._helpers import get_last_user_message
+    from utils.language import normalize_ar, to_ascii_digits
+
+    # Skip entirely if conversation_node already handled the turn as a price
+    # inquiry — re-extracting "8 مساء" here would overwrite that reply.
+    if updates.get("_price_handled"):
+        return updates
 
     # Only intervene if LLM didn't already set the right flags
     if updates.get("wants_more_slots") or updates.get("preferred_time") or updates.get("slots_filter"):
@@ -320,11 +344,34 @@ def _slot_safety_net(state: dict, updates: dict) -> dict:
     if not last_msg:
         return updates
 
-    msg_lower = last_msg.lower().strip()
+    # Normalize for keyword matching (strip hamza, ta-marbuta, Arabic digits → ASCII)
+    msg_norm = normalize_ar(last_msg)
+    # Also keep a digit-normalized copy for regex (preserves Arabic letters)
+    msg_digits_ascii = to_ascii_digits(last_msg).lower().strip()
+
+    # Relative-date keyword ("today"/"tomorrow"/"بكرا") → set requested_date, don't filter slots
+    for kw in sorted(_RELATIVE_DATE_KEYWORDS, key=len, reverse=True):
+        if kw in msg_norm:
+            # Translate Saudi tomorrow variants → standard word resolve_relative_date understands
+            if kw in ("بكرا", "بكره", "بكرة", "غدا", "غداً", "tomorrow"):
+                updates["requested_date"] = "tomorrow"
+            else:
+                updates["requested_date"] = "today"
+            state["last_bot_message"] = ""
+            return updates
+
+    # Specific time wins over period-only filter. "8 مساء" / "7 pm" is a
+    # specific slot request, not a "show me the evening list" request — check
+    # this BEFORE the bare period-keyword branch below.
+    if _BARE_TIME_PATTERN.search(msg_digits_ascii):
+        m = _BARE_TIME_PATTERN.search(msg_digits_ascii)
+        updates["preferred_time"] = m.group(0).strip()
+        state["last_bot_message"] = ""
+        return updates
 
     # Check for time period keywords → wants_more_slots + slots_filter
     for period in sorted(_TIME_PERIOD_KEYWORDS, key=len, reverse=True):
-        if period in msg_lower:
+        if period in msg_norm or period in last_msg.lower():
             updates["wants_more_slots"] = True
             updates["slots_filter"] = period
             state["last_bot_message"] = ""  # Clear LLM's reply
@@ -334,23 +381,22 @@ def _slot_safety_net(state: dict, updates: dict) -> dict:
     show_keywords = {"show all", "show slot", "show available", "all slot", "what else",
                      "list", "available", "عرض", "المتاح", "كل المواعيد"}
     for kw in show_keywords:
-        if kw in msg_lower:
+        if kw in msg_norm:
             updates["wants_more_slots"] = True
             state["last_bot_message"] = ""
             return updates
 
-    # Check for specific time patterns ("after 7", "at 8", "8 PM")
-    if _TIME_PATTERN.search(msg_lower) or _BARE_TIME_PATTERN.search(msg_lower):
-        # Extract the time text
-        match = _TIME_PATTERN.search(msg_lower) or _BARE_TIME_PATTERN.search(msg_lower)
+    # Check for specific time patterns ("after 7", "at 8", "8 PM", "٨ مساء")
+    if _TIME_PATTERN.search(msg_digits_ascii) or _BARE_TIME_PATTERN.search(msg_digits_ascii):
+        match = _TIME_PATTERN.search(msg_digits_ascii) or _BARE_TIME_PATTERN.search(msg_digits_ascii)
         if match:
             updates["preferred_time"] = match.group(0).strip()
             state["last_bot_message"] = ""
             return updates
 
-    # Check for bare numbers that look like times (e.g. "7", "8")
+    # Check for bare numbers that look like times (e.g. "7", "8", "٨")
     # Only if the message is very short (1-3 words) to avoid false positives
-    words = msg_lower.split()
+    words = msg_digits_ascii.split()
     if len(words) <= 3:
         for word in words:
             if re.match(r'^\d{1,2}(:\d{2})?$', word):
