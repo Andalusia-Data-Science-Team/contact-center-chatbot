@@ -20,6 +20,7 @@ PATH 3 — Patient names a specific doctor (e.g. "booking with Dr. Ahmad"):
 The specialty confirmation step makes the flow feel more natural —
 the bot doesn't just dump a doctor list out of nowhere.
 """
+import re
 from state import BookingState
 from nodes._helpers import get_last_user_message, is_acceptance
 from llm.client import call_llm
@@ -27,8 +28,37 @@ from services.router import route_specialty
 from services.doctor_selector import fetch_doctors
 from services.formatter import doctor_list_message, no_doctors_message
 from prompts.triage import TRIAGE_PROMPT_EN, TRIAGE_PROMPT_AR
-from utils.datetime_fmt import format_date
+from utils.datetime_fmt import format_date, resolve_relative_date
+from utils.language import normalize_ar
 from config.constants import SPECIALTY_EN_TO_AR
+
+
+# Tokens that signal the patient is moving forward (giving a date/time) while
+# implicitly accepting the specialty. Without this, "بكرا" after the specialty
+# confirmation question is misread as "no, different specialty" and loops.
+_DATE_TIME_HINTS = (
+    "today", "tomorrow", "tonight", "morning", "afternoon", "evening", "night",
+    "am", "pm",
+    "اليوم", "بكرا", "بكره", "غدا", "غدًا", "الليله", "الليلة",
+    "الصبح", "الصباح", "صباح", "الظهر", "بعد الظهر", "العصر", "بعد العصر",
+    "المغرب", "المسا", "المساء", "مساء", "الليل",
+)
+
+
+def _looks_like_date_time_hint(text: str) -> bool:
+    """True if the message reads like a date/time preference rather than a
+    different specialty or a rejection. Used to treat 'بكرا' as implicit
+    acceptance of the proposed specialty."""
+    if not text:
+        return False
+    t = normalize_ar(text).lower()
+    # Presence of digits = explicit time (e.g. '٨ مساء', '8 pm')
+    if re.search(r"\d", t):
+        return True
+    for tok in _DATE_TIME_HINTS:
+        if tok in t:
+            return True
+    return False
 
 
 def routing_node(state: BookingState) -> BookingState:
@@ -161,7 +191,20 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
     if not last_msg:
         return state
 
-    if is_acceptance(last_msg):
+    # Treat a bare date/time hint ("بكرا", "اليوم", "٨ مساء") as implicit
+    # acceptance — the patient is moving forward and telling us WHEN, not
+    # rejecting the specialty. Also capture it as requested_date / preferred_time
+    # so the downstream slot selection uses it.
+    implicit_accept = False
+    if not is_acceptance(last_msg) and _looks_like_date_time_hint(last_msg):
+        implicit_accept = True
+        resolved = resolve_relative_date(last_msg)
+        if resolved and re.match(r"^\d{4}-\d{2}-\d{2}$", resolved):
+            state["requested_date"] = resolved
+        else:
+            state["preferred_time"] = last_msg
+
+    if is_acceptance(last_msg) or implicit_accept:
         # Patient confirmed — fetch doctors and show list
         state["specialty_confirmed"] = True
         specialty = state.get("speciality") or state.get("speciality_ar") or ""

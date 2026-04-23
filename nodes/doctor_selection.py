@@ -2,7 +2,9 @@
 """
 Handles doctor matching from patient input and fetching their available slots.
 """
+import re
 from state import BookingState
+from nodes._helpers import get_last_user_message
 from services.doctor_selector import match_doctor, fetch_slots
 from services.slot_handler import get_initial_slots
 from services.formatter import (
@@ -10,6 +12,43 @@ from services.formatter import (
     doctor_not_found_message,
 )
 from utils.datetime_fmt import format_date, format_time
+from utils.language import normalize_ar
+
+
+# Signals the patient is ready to proceed even though they didn't explicitly
+# pick a doctor by number or name. When at doctor_list stage and any of these
+# show up, auto-pick the first doctor so the flow advances instead of looping
+# "تحب تحجز مع أي دكتور؟".
+_PROCEED_HINTS = (
+    "yes", "ok", "sure", "fine", "perfect", "works", "confirmed",
+    "today", "tomorrow", "tonight", "morning", "afternoon", "evening", "night",
+    "am", "pm", "cash", "insurance", "insured",
+    "نعم", "ايوه", "تمام", "ماشي", "مناسب", "موافق", "يناسبني",
+    "اليوم", "بكرا", "بكره", "غدا", "الصبح", "الصباح",
+    "الظهر", "العصر", "المغرب", "المساء", "مساء", "الليل", "الليله",
+    "كاش", "نقدي", "تامين", "تأمين",
+)
+
+_REJECT_HINTS = ("لا", "no", "not", "مش", "مو", "ما")
+
+
+def _user_signals_proceed(text: str) -> bool:
+    """True if the message reads like the patient is ready to proceed
+    (time / date / phone / cash-insurance / acceptance) rather than picking
+    a specific doctor or rejecting."""
+    if not text:
+        return False
+    t = normalize_ar(text).lower()
+    for neg in _REJECT_HINTS:
+        if re.search(rf"(?<![\w]){re.escape(neg)}(?![\w])", t):
+            return False
+    # Phone number (7+ digits) is a clear "proceed" signal
+    if re.search(r"\d{7,}", t):
+        return True
+    for hint in _PROCEED_HINTS:
+        if hint in t:
+            return True
+    return False
 
 
 def doctor_selection_node(state: BookingState) -> BookingState:
@@ -32,6 +71,24 @@ def doctor_selection_node(state: BookingState) -> BookingState:
     if updates.get("needs_slot_query") and state.get("doctor"):
         state["last_bot_message"] = _handle_slot_fetch(state, lang)
         return state
+
+    # Case 3: Patient is at doctor_list stage, no doctor picked, and their
+    # message signals "ready to proceed" (gave a time/phone/insurance/acceptance)
+    # rather than picking a specific doctor. Auto-pick the first available
+    # doctor so the flow advances instead of looping on "which doctor?".
+    if (
+        state.get("booking_stage") == "doctor_list"
+        and not state.get("doctor")
+        and state.get("available_doctors")
+    ):
+        last_msg = get_last_user_message(state) or ""
+        if _user_signals_proceed(last_msg):
+            doc = state["available_doctors"][0]
+            state["doctor"] = doc.get("Doctor", "")
+            state["doctor_ar"] = doc.get("DoctorAR", "")
+            state["walk_in_price"] = doc.get("WalkInPrice")
+            state["last_bot_message"] = _handle_slot_fetch(state, lang)
+            return state
 
     return state
 

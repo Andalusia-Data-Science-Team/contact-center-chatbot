@@ -64,12 +64,31 @@ def call_llm(
         payload["response_format"] = {"type": "json_object"}
 
     start_time = time.time()
-    response = requests.post(
-        f"{FIREWORKS_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30,
+    # Retry transient network errors (SSL resets, timeouts) with exponential
+    # backoff. Without this a single ConnectionResetError crashes the whole
+    # booking — in testing this was the #1 cause of aborted scenarios.
+    _TRANSIENT_EXC = (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ChunkedEncodingError,
     )
+    response = None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{FIREWORKS_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            break
+        except _TRANSIENT_EXC as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(1 + attempt)  # 1s, 2s
+                continue
+            raise
     latency_ms = int((time.time() - start_time) * 1000)
     response.raise_for_status()
 

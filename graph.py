@@ -69,6 +69,19 @@ def _safety_net(state: BookingState) -> BookingState:
                 state["last_bot_message"] = f"أهلا وسهلا بحضرتك {greeting}، ازاي أقدر أساعدك؟"
             else:
                 state["last_bot_message"] = f"Welcome {patient}! How can I help you today?"
+        elif stage == "complaint":
+            patient = state.get("patient_name", "")
+            if lang == "ar":
+                name_part = f" أ/ {patient}" if patient else ""
+                state["last_bot_message"] = (
+                    f"تمام{name_part} — ممكن تقولي إيه المشكلة اللي محتاج كشف عليها؟ "
+                    f"أو تخصص الدكتور اللي تبغى تحجز معاه؟"
+                )
+            else:
+                state["last_bot_message"] = (
+                    f"Got it — could you tell me what you're dealing with, "
+                    f"or which specialty you'd like to book with?"
+                )
         elif stage == "doctor_list":
             if lang == "ar":
                 state["last_bot_message"] = "تحب تحجز مع أي دكتور من القائمة؟ قولي رقم الدكتور أو اسمه."
