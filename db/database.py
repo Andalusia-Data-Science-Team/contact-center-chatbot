@@ -266,13 +266,34 @@ def query_doctor_slots_with_fallback(
     return [], start.strftime("%Y-%m-%d")
 
 
+def _is_clinic_placeholder(doctor_en: str, doctor_ar: str) -> bool:
+    """True if the 'doctor' row is actually a clinic/station placeholder.
+
+    The Dotcare availability table occasionally exposes walk-in clinics under
+    the Physician column (e.g. "عيادة محطة الفرسان", "Clinic Jazan"). These
+    aren't bookable doctors — filter them out before they surface in the
+    doctor list.
+    """
+    en = (doctor_en or "").strip().lower()
+    ar = (doctor_ar or "").strip()
+    if en.startswith("clinic") or " clinic " in f" {en} ":
+        return True
+    if ar.startswith("عيادة") or ar.startswith("عياده"):
+        return True
+    return False
+
+
 def aggregate_doctor_slots(rows: list) -> list:
     from collections import defaultdict
     doctors = defaultdict(list)
     for row in rows:
         doc = (row.get("Doctor") or "").strip()
-        if doc:
-            doctors[doc].append(row)
+        doc_ar = (row.get("DoctorAR") or "").strip()
+        if not doc:
+            continue
+        if _is_clinic_placeholder(doc, doc_ar):
+            continue
+        doctors[doc].append(row)
 
     result = []
     for doctor_name, doc_rows in doctors.items():

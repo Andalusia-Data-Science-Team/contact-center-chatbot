@@ -16,6 +16,13 @@ from config.constants import (
 )
 from config.settings import PEDIATRIC_AGE_THRESHOLD
 from prompts.routing import ROUTE_PROMPT_EN, ROUTE_PROMPT_AR
+from utils.language import normalize_ar
+
+try:
+    from rapidfuzz import fuzz, process as _rf_process
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SYMPTOM → SPECIALTY MAPPING
@@ -310,6 +317,13 @@ SYMPTOM_MAP_AR = {
     "ثدي":               ["Breast Surgery", "OBE & GYN"],
     "عقم":               ["IVF", "OBE & GYN"],
     "تأخر حمل":          ["IVF"],
+    "تاخر حمل":          ["IVF"],
+    "حقن مجهري":         ["IVF"],
+    "حقن مجهرى":         ["IVF"],
+    "اطفال انابيب":      ["IVF"],
+    "أطفال أنابيب":      ["IVF"],
+    "تلقيح صناعي":       ["IVF"],
+    "تلقيح":             ["IVF"],
 
     # ── أطفال ──
     "طفل":               ["General Pediatrics"],
@@ -336,6 +350,10 @@ SYMPTOM_MAP_AR = {
     "تقويم":             ["Orthodontic"],
     "جذور":              ["Endodontic"],
     "عصب سن":            ["Endodontic"],
+    "عصب اسنان":         ["Endodontic"],
+    "عصب أسنان":         ["Endodontic"],
+    "قناة جذر":          ["Endodontic"],
+    "علاج جذور":         ["Endodontic"],
     "فك":                ["Maxillofacial Surgery"],
 
     # ── غدد وهرمونات ──
@@ -366,6 +384,15 @@ SYMPTOM_MAP_AR = {
     "علاج طبيعي":        ["Physiotherapy"],
     "تأهيل":             ["Physiotherapy"],
 }
+
+# Pre-normalize AR keywords once at module load. Matching against normalized
+# text and normalized keys collapses hamza/ta-marbuta/ya variants so that
+# "أذن" == "اذن" and "حقن مجهرى" == "حقن مجهري".
+_SYMPTOM_MAP_AR_NORMALIZED = {normalize_ar(k): v for k, v in SYMPTOM_MAP_AR.items()}
+
+# Flat list of normalized AR keys for rapidfuzz fallback. Single-word keys only —
+# multi-word keys (e.g. "حقن مجهري") need substring matching, not fuzzy.
+_AR_SINGLE_KEYS = [k for k in _SYMPTOM_MAP_AR_NORMALIZED if " " not in k and len(k) >= 3]
 
 # Specialties that should NEVER be shown to patients as routing targets
 NON_BOOKABLE = {
@@ -451,20 +478,45 @@ def _keyword_prefilter(text: str, lang: str, age: int) -> list:
     Match symptom keywords to candidate specialties.
     Returns a deduplicated list of EN specialty names, ordered by match frequency.
     If age < pediatric threshold, also adds pediatric variants.
+
+    For Arabic, text and keywords are normalized (hamza/ta-marbuta/ya variants
+    collapsed) so "أذن"/"اذن" match the same key. A rapidfuzz pass also catches
+    single-character typos like "تغزية"→"تغذية" or "صدع"→"صداع".
     """
     from collections import Counter
 
-    # Search both EN and AR keywords regardless of language
+    # EN: substring match on lower-cased text (text is already lowercased by caller)
     hits = Counter()
     for keyword, specs in SYMPTOM_MAP.items():
         if keyword in text:
             for i, s in enumerate(specs):
                 hits[s] += (len(specs) - i)  # Higher weight for first-listed specialty
 
-    for keyword, specs in SYMPTOM_MAP_AR.items():
-        if keyword in text:
-            for i, s in enumerate(specs):
-                hits[s] += (len(specs) - i)
+    # AR: substring match on normalized text vs normalized keys
+    ar_text = normalize_ar(text)
+    if ar_text:
+        for keyword, specs in _SYMPTOM_MAP_AR_NORMALIZED.items():
+            if keyword in ar_text:
+                for i, s in enumerate(specs):
+                    hits[s] += (len(specs) - i)
+
+        # Typo-tolerant fallback: only run if substring matching found nothing.
+        # score_cutoff=80 = one substitution in a 5-char word (e.g. تغزية→تغذية).
+        # Shorter tokens (3-4 chars) need to be nearly identical to pass 80%.
+        if not hits and _HAS_RAPIDFUZZ and _AR_SINGLE_KEYS:
+            seen = set()
+            for token in ar_text.split():
+                if len(token) < 3 or token in seen:
+                    continue
+                seen.add(token)
+                match = _rf_process.extractOne(
+                    token, _AR_SINGLE_KEYS,
+                    scorer=fuzz.ratio, score_cutoff=80,
+                )
+                if match:
+                    matched_key = match[0]
+                    for i, s in enumerate(_SYMPTOM_MAP_AR_NORMALIZED[matched_key]):
+                        hits[s] += (len(_SYMPTOM_MAP_AR_NORMALIZED[matched_key]) - i)
 
     if not hits:
         return []
