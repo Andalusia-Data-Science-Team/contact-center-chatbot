@@ -63,7 +63,6 @@ def call_llm(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    start_time = time.time()
     # Retry transient network errors (SSL resets, timeouts) with exponential
     # backoff. Without this a single ConnectionResetError crashes the whole
     # booking — in testing this was the #1 cause of aborted scenarios.
@@ -72,51 +71,62 @@ def call_llm(
         requests.exceptions.Timeout,
         requests.exceptions.ChunkedEncodingError,
     )
-    response = None
-    last_exc = None
-    for attempt in range(3):
-        try:
-            response = requests.post(
-                f"{OPENROUTER_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            break
-        except _TRANSIENT_EXC as e:
-            last_exc = e
-            if attempt < 2:
-                time.sleep(1 + attempt)  # 1s, 2s
-                continue
-            raise
-    latency_ms = int((time.time() - start_time) * 1000)
-    response.raise_for_status()
 
-    resp_json = response.json()
-    content = resp_json["choices"][0]["message"]["content"].strip()
+    # When json_mode is on, the LLM occasionally emits malformed JSON
+    # (broken \uXXXX escapes, truncated strings). Re-rolling almost always
+    # produces valid JSON, so retry the whole call up to 3 times.
+    json_max_attempts = 3 if json_mode else 1
 
-    # Extract token usage from API response
-    usage = resp_json.get("usage", {})
-    input_tokens = usage.get("prompt_tokens", 0)
-    output_tokens = usage.get("completion_tokens", 0)
+    for json_attempt in range(json_max_attempts):
+        start_time = time.time()
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{OPENROUTER_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                break
+            except _TRANSIENT_EXC:
+                if attempt < 2:
+                    time.sleep(1 + attempt)  # 1s, 2s
+                    continue
+                raise
+        latency_ms = int((time.time() - start_time) * 1000)
+        response.raise_for_status()
 
-    # Accumulate metrics
-    _turn_metrics["llm_calls"] += 1
-    _turn_metrics["total_input_tokens"] += input_tokens
-    _turn_metrics["total_output_tokens"] += output_tokens
-    _turn_metrics["total_latency_ms"] += latency_ms
-    _turn_metrics["calls_detail"].append({
-        "label": label,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "latency_ms": latency_ms,
-    })
+        resp_json = response.json()
+        content = resp_json["choices"][0]["message"]["content"].strip()
 
-    if json_mode:
+        usage = resp_json.get("usage", {})
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+
+        _turn_metrics["llm_calls"] += 1
+        _turn_metrics["total_input_tokens"] += input_tokens
+        _turn_metrics["total_output_tokens"] += output_tokens
+        _turn_metrics["total_latency_ms"] += latency_ms
+        _turn_metrics["calls_detail"].append({
+            "label": label,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "latency_ms": latency_ms,
+        })
+
+        if not json_mode:
+            return content
+
         content = _clean_json(content)
-        return json.loads(content)
-
-    return content
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            if json_attempt < json_max_attempts - 1:
+                print(f"[call_llm:{label}] malformed JSON on attempt {json_attempt + 1}/{json_max_attempts}, retrying. Error: {e}")
+                continue
+            print(f"[call_llm:{label}] all {json_max_attempts} JSON attempts failed. Last content (truncated): {content[:300]}")
+            raise
 
 
 def _clean_json(content: str) -> str:
