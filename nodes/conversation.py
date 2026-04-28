@@ -22,6 +22,34 @@ from utils.language import normalize_ar
 _CASH_WORDS = {"cash", "self pay", "self-pay", "self", "كاش", "نقدي", "نقداً", "نقدا"}
 _INS_WORDS = {"insurance", "insured", "تأمين", "تامين"}
 
+# Cancellation phrases — patient wants to abandon the booking. Detected in code
+# (not via LLM) so a clear cancel is honoured deterministically.
+# IMPORTANT: patterns must use *normalized* Arabic — `normalize_ar` maps
+# أ/إ/آ → ا, ى → ي, ة → ه — so e.g. "ابغى" arrives here as "ابغي".
+_CANCEL_PATTERNS = (
+    r"\b(?:cancel|stop|nevermind|never\s*mind|forget\s*it)\b",
+    r"\b(?:don'?t|do\s*not)\s*want\s*to\s*book\b",
+    r"\bnot\s*(?:interested|now|today)\b",
+    r"خلاص\s*(?:ما|مش|مو|ماني)?\s*(?:ابغي|اريد|عايز|بدي|محتاج|ابي|حابب|حاب)",
+    r"(?:ما|مش|مو|ماني)\s*(?:ابغي|اريد|عايز|بدي|ابي|حاب)\s*(?:احجز|اكمل|اتابع)",
+    r"الغ(?:اء|ي)\s*الحجز",
+    r"\bبطل\s*الحجز\b",
+    r"غير\s*رايي",
+    r"عدلت\s*عن",
+)
+
+
+def _is_cancellation(text: str) -> bool:
+    """True if the patient is clearly cancelling/abandoning the booking.
+
+    Operates on *normalized* Arabic — normalize the text first so the same
+    pattern works for "ابغى" (alif-maqsura ya) and "ابغي" (regular ya).
+    """
+    if not text:
+        return False
+    t = normalize_ar(text).lower()
+    return any(re.search(p, t, re.IGNORECASE) for p in _CANCEL_PATTERNS)
+
 # Word-boundary regexes for the keyword safety net — can be called on any
 # length of message, unlike _detect_insurance_answer which is short-phrase only.
 _CASH_PATTERN = re.compile(
@@ -141,6 +169,52 @@ def conversation_node(state: BookingState) -> BookingState:
     lang = state.get("language", "en")
     messages = state.get("messages", [])
 
+    # Already cancelled — don't re-engage the booking LLM. Just acknowledge.
+    if state.get("booking_stage") == "cancelled":
+        state["_llm_updates"] = {}
+        if lang == "ar":
+            state["last_bot_message"] = (
+                "الحجز ملغي. لو حابب تبدأ حجز جديد، قولي. 🌿"
+            )
+        else:
+            state["last_bot_message"] = (
+                "The booking has been cancelled. Let me know if you'd like to start a new one. 🌿"
+            )
+        return state
+
+    # Callback already promised — don't re-prompt for booking details. The
+    # contact-center team owns the next step.
+    if state.get("booking_stage") == "callback_pending":
+        state["_llm_updates"] = {}
+        if lang == "ar":
+            state["last_bot_message"] = (
+                "تمام، سجلنا طلبك وفريق خدمة العملاء راح يتواصل مع حضرتك قريباً 🌿"
+            )
+        else:
+            state["last_bot_message"] = (
+                "All set — your request is logged and the contact-center team will reach out shortly 🌿"
+            )
+        return state
+
+    # Cancellation safety net — patient said "خلاص ما ابغى احجز", "cancel", etc.
+    # Acknowledge gracefully and short-circuit the rest of the booking pipeline.
+    last_user_msg_early = get_last_user_message(state) or ""
+    if _is_cancellation(last_user_msg_early) and state.get("booking_stage") not in (
+        None, "", "not started", "complete", "cancelled"
+    ):
+        state["booking_stage"] = "cancelled"
+        state["_llm_updates"] = {}
+        if lang == "ar":
+            state["last_bot_message"] = (
+                "تمام، تم إلغاء الحجز. لو احتجت أي مساعدة في وقت ثاني، تواصل معنا 🌿"
+            )
+        else:
+            state["last_bot_message"] = (
+                "No problem — your booking has been cancelled. Reach out anytime "
+                "if you'd like to book later 🌿"
+            )
+        return state
+
     # If we just asked "cash or insurance?" to answer a price question, and the
     # user's reply is a clear cash/insurance answer, handle it in code — the LLM
     # at slot_selection stage would otherwise misread "cash" as a time input.
@@ -175,11 +249,43 @@ def conversation_node(state: BookingState) -> BookingState:
 
     reply = result.get("reply", "")
     updates = result.get("state_updates", {})
+
+    # Safety net: reject ambiguous insured extraction.
+    # When the bot just asked "كاش ام تأمين؟" and the patient replies with a bare
+    # "أيوه" / "yes" / "نعم" / "no" / "لا", the LLM sometimes silently extracts
+    # insured=False. The patient never clarified — re-ask instead of guessing.
+    if updates.get("insured") is not None and state.get("insured") is None:
+        msg = (last_user_msg_early or "").strip()
+        has_clear_signal = _scan_insurance_keywords(msg) is not None
+        is_short = len(msg.split()) <= 2
+        if is_short and not has_clear_signal:
+            updates["insured"] = None
+            # Override the LLM reply with an explicit re-ask so the patient
+            # can give a clear answer.
+            if state.get("booking_stage") in ("patient_info", "slot_selection") \
+                    and state.get("phone"):
+                if lang == "ar":
+                    reply = "محتاج أعرف، الكشف كاش ولا تأمين؟"
+                else:
+                    reply = "Just to confirm — is this cash or insurance?"
+
     apply_llm_updates(state, updates)
 
     # Guard: never jump to patient_info or complete without a confirmed slot
     if state.get("booking_stage") in ("patient_info", "complete") and not state.get("selected_slot"):
         state["booking_stage"] = "slot_selection" if state.get("doctor") else "doctor_list"
+
+    # Guard: never jump past routing while a specialty is set but unconfirmed.
+    # Without this, "بعد المغرب" after the specialty-confirmation question
+    # makes the LLM set booking_stage=slot_selection directly, skipping the
+    # routing node's implicit-accept path and leaving no doctors loaded.
+    if (
+        state.get("booking_stage") in ("doctor_list", "slot_selection", "patient_info", "complete")
+        and state.get("speciality")
+        and not state.get("specialty_confirmed")
+        and not state.get("available_doctors")
+    ):
+        state["booking_stage"] = "routing"
 
     last_user_msg = get_last_user_message(state) or ""
 

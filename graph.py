@@ -52,7 +52,26 @@ def _safety_net(state: BookingState) -> BookingState:
         lang = state.get("language", "en")
         stage = state.get("booking_stage")
 
-        if stage == "routing":
+        if stage == "cancelled":
+            # Cancellation reply is owned by conversation_node; if it somehow
+            # got cleared, fall back to a polite confirmation rather than the
+            # generic "could you rephrase" clarifier.
+            if lang == "ar":
+                state["last_bot_message"] = "تمام، تم إلغاء الحجز 🌿"
+            else:
+                state["last_bot_message"] = "Your booking has been cancelled 🌿"
+        elif stage == "callback_pending":
+            # Callback promised by doctor_selection_node — keep the
+            # acknowledgment consistent if the reply was wiped.
+            if lang == "ar":
+                state["last_bot_message"] = (
+                    "سجلنا طلبك وفريق خدمة العملاء راح يتواصل مع حضرتك قريباً 🌿"
+                )
+            else:
+                state["last_bot_message"] = (
+                    "Your request is logged — the contact-center team will reach out shortly 🌿"
+                )
+        elif stage == "routing":
             if lang == "ar":
                 state["last_bot_message"] = "ممكن توضحلي وش المشكلة عشان أقدر أساعدك؟"
             else:
@@ -111,6 +130,9 @@ def _safety_net(state: BookingState) -> BookingState:
 
     # Clean up transient data (but NOT followup_message — app.py reads it after)
     state["_llm_updates"] = None
+    # One-turn freshness flag: only the turn that shows the proposal sets it,
+    # so the NEXT turn's slot_selection treats the user message as a reply.
+    state["_proposal_shown_this_turn"] = False
     return state
 
 

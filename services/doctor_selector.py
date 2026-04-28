@@ -27,12 +27,12 @@ def fetch_doctors(specialty: str, lang: str, preferred_date: str = None) -> tupl
     """
     # Always try EN first (routing returns EN names)
     rows, used_date = query_availability_with_fallback(
-        specialty_en=specialty, specialty_ar=None
+        specialty_en=specialty, specialty_ar=None, preferred_date=preferred_date,
     )
     # Fallback: try as AR name in case it's an AR specialty somehow
     if not rows:
         rows, used_date = query_availability_with_fallback(
-            specialty_en=None, specialty_ar=specialty
+            specialty_en=None, specialty_ar=specialty, preferred_date=preferred_date,
         )
 
     doctors = aggregate_doctor_slots(rows)

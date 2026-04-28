@@ -33,9 +33,13 @@ class BookingState(TypedDict):
     available_slots: List[Any]
 
     patient_name: Optional[str]
+    caregiver_name: Optional[str]            # Person bringing the patient (parent, spouse, etc.)
+    is_for_someone_else: Optional[bool]      # True when patient_name refers to a child / relative
     phone: Optional[str]
     insured: Optional[bool]
     insurance_company: Optional[str]
+
+    slot_confirmed: bool                     # True once the patient has confirmed selected_slot
 
     walk_in_price: Optional[float]          # Cash price for the selected doctor (from CRM)
     _walk_in_price_doctor: Optional[str]    # Tracks which doctor the price was fetched for
@@ -46,6 +50,8 @@ class BookingState(TypedDict):
     followup_message: Optional[str]     # Second message sent after the main reply (e.g., app download prompt)
     _llm_updates: Optional[dict]          # transient: LLM state_updates for current turn
     _proposed_slot: Optional[dict]         # transient: slot proposed but not yet confirmed
+    _partial_doctor_name: Optional[str]    # last partial doctor name patient typed (normalized)
+    _partial_doctor_attempts: int          # consecutive turns the same partial name was repeated
 
     # ── Dev metrics (accumulated across the full session) ──
     _session_total_input_tokens: int
@@ -81,9 +87,12 @@ def initial_state() -> BookingState:
         available_doctors=[],
         available_slots=[],
         patient_name=None,
+        caregiver_name=None,
+        is_for_someone_else=None,
         phone=None,
         insured=None,
         insurance_company=None,
+        slot_confirmed=False,
         walk_in_price=None,
         _walk_in_price_doctor=None,
         _pending_price_followup=False,
@@ -92,6 +101,8 @@ def initial_state() -> BookingState:
         followup_message=None,
         _llm_updates=None,
         _proposed_slot=None,
+        _partial_doctor_name=None,
+        _partial_doctor_attempts=0,
         _session_total_input_tokens=0,
         _session_total_output_tokens=0,
         _session_total_llm_calls=0,

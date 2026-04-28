@@ -147,6 +147,11 @@ SYMPTOM_MAP = {
     "breast lump":       ["Breast Surgery"],
     "infertility":       ["IVF", "OBE & GYN"],
     "ivf":               ["IVF"],
+    "icsi":              ["IVF"],
+    "fertility":         ["IVF", "OBE & GYN"],
+    "test tube":         ["IVF"],
+    "micro injection":   ["IVF"],
+    "microinjection":    ["IVF"],
 
     # ── Children ──
     "child":             ["General Pediatrics"],

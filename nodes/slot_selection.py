@@ -33,9 +33,44 @@ def slot_selection_node(state: BookingState) -> BookingState:
     updates = state.get("_llm_updates") or {}
     stage = state.get("booking_stage")
 
+    if stage in ("cancelled", "callback_pending"):
+        return state
+
     # Must be in an active booking with a doctor to do anything here
     if not state.get("doctor"):
         return state
+
+    # ── Auto-confirm proposed slot when user signals proceed ──
+    # If a slot was proposed last turn and the user's reply is a phone number,
+    # a cash/insurance answer, or an acceptance token — lock it in now instead
+    # of looping on "does this time work?".
+    if (
+        stage in ("slot_selection", "patient_info")
+        and state.get("_proposed_slot")
+        and not state.get("selected_slot")
+        and not state.get("_proposal_shown_this_turn")
+    ):
+        from nodes._helpers import get_last_user_message
+        last_msg = get_last_user_message(state) or ""
+        if _message_accepts_proposal(last_msg):
+            proposed = state["_proposed_slot"]
+            state["selected_slot"] = proposed["time_24"]
+            state["date"] = proposed["date"]
+            state["_proposed_slot"] = None
+            if is_patient_info_complete(state):
+                state["booking_stage"] = "complete"
+                state["last_bot_message"] = confirmation_message(state, lang)
+            else:
+                state["booking_stage"] = "patient_info"
+                # Only replace the LLM reply if it's empty — the LLM may have
+                # already answered a bundled question (e.g. cash-or-insurance).
+                if not (state.get("last_bot_message") or "").strip():
+                    state["last_bot_message"] = slot_confirmed_message(
+                        state["doctor"], state.get("doctor_ar", ""),
+                        proposed["date_display"], proposed["time_display"], lang,
+                        is_fallback=False,
+                    )
+            return state
 
     # ── Safety net: detect slot-related requests the LLM missed ──
     # If LLM generated a non-empty reply but the user's message contains
@@ -54,6 +89,19 @@ def slot_selection_node(state: BookingState) -> BookingState:
         if stage == "patient_info":
             state["selected_slot"] = None
             state["booking_stage"] = "slot_selection"
+
+        # If the same message also requested a different date ("tomorrow evening")
+        # refetch slots for that date FIRST so the filter applies to the right
+        # day. Otherwise the patient sees today's evening slots when they meant
+        # tomorrow's.
+        new_date = state.get("requested_date")
+        if new_date and new_date != state.get("date") and state.get("doctor"):
+            state["selected_slot"] = None
+            state["_proposed_slot"] = None
+            _handle_slot_fetch(state, lang, preferred_date=new_date)
+            # _handle_slot_fetch repopulates state["available_slots"] / state["date"];
+            # fall through to filter the new list.
+
         filter_text = updates.get("slots_filter") or ""
         time_filter = parse_time_filter(filter_text) if filter_text else {"start": None, "end": None, "label": ""}
 
@@ -93,13 +141,28 @@ def slot_selection_node(state: BookingState) -> BookingState:
         return state
 
     # ── Patient asks for a different date → re-fetch slots ──
-    if (stage == "slot_selection"
+    # Use the RESOLVED date from state (apply_llm_updates resolved "بكرا"→ISO)
+    # rather than the raw LLM value in updates — passing "بكرا"/"today" through
+    # query_doctor_slots_with_fallback fails strptime and falls back to today,
+    # silently booking the wrong day.
+    # Skip the refetch when the resolved date matches state.date — the LLM
+    # often re-emits requested_date redundantly even when no date change was
+    # asked for, and refetching would just churn through the same DB query.
+    if (stage in ("slot_selection", "patient_info")
             and updates.get("requested_date")
-            and not state.get("selected_slot")):
-        state["last_bot_message"] = _handle_slot_fetch(
-            state, lang, preferred_date=updates["requested_date"]
-        )
-        return state
+            and state.get("doctor")):
+        resolved_date = state.get("requested_date") or updates["requested_date"]
+        if resolved_date and resolved_date != state.get("date"):
+            # Mid-flow date change: an earlier slot was already auto-picked
+            # (often for today) but the patient now says "يوم الخميس".
+            # Clear the auto-pick so the booking lands on the right day.
+            state["selected_slot"] = None
+            state["_proposed_slot"] = None
+            state["booking_stage"] = "slot_selection"
+            state["last_bot_message"] = _handle_slot_fetch(
+                state, lang, preferred_date=resolved_date,
+            )
+            return state
 
     # ── Patient gives a time preference ──
     # BUT NOT on the same turn the doctor was just selected (needs_slot_query flag)
@@ -214,6 +277,7 @@ def _handle_time_preference(preferred_raw: str, state: dict, lang: str) -> str:
             "date": nearest["date"].strftime("%Y-%m-%d"),
             "date_display": date_str,
         }
+        state["_proposal_shown_this_turn"] = True
 
         doc = state.get("doctor", "")
         doc_ar = state.get("doctor_ar", "")
@@ -221,13 +285,27 @@ def _handle_time_preference(preferred_raw: str, state: dict, lang: str) -> str:
         prefix = "د. " if lang == "ar" else "Dr. "
         target_display = format_time(target, lang)
 
+        # is_fallback=True means no slot exists at/after the target → the
+        # offered slot is BEFORE what the patient asked for. Don't call that
+        # the "nearest" slot — it misleads the patient.
+        if nearest.get("is_fallback"):
+            if lang == "ar":
+                return (
+                    f"للأسف ما في مواعيد متاحة بعد {target_display} مع {prefix}{doc_name}.\n\n"
+                    f"أقرب موعد قبلها هو **{time_str}**. تناسبك؟ أو تبغى يوم ثاني؟"
+                )
+            return (
+                f"There are no slots available after {target_display} with {prefix}{doc_name}.\n\n"
+                f"The closest earlier slot is **{time_str}**. Does that work, or would you like a different day?"
+            )
+
         if lang == "ar":
             return (
-                f"أقرب موعد لـ {target_display} مع {prefix}{doc_name} هو **{time_str}**.\n\n"
+                f"أقرب موعد بعد {target_display} مع {prefix}{doc_name} هو **{time_str}**.\n\n"
                 f"يناسبك؟ أو قولي وقت ثاني."
             )
         return (
-            f"The closest slot to {target_display} with {prefix}{doc_name} is **{time_str}**.\n\n"
+            f"The next slot after {target_display} with {prefix}{doc_name} is **{time_str}**.\n\n"
             f"Does that work? Or let me know another time."
         )
 
@@ -254,7 +332,9 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
     from services.formatter import slot_question
     from db.database import query_doctor_slots_with_fallback
 
-    date_to_use = preferred_date or state.get("date")
+    # Mirrors doctor_selection._handle_slot_fetch: honour requested_date so a
+    # mid-flow date change ("ابغى يوم بكرا") actually refetches for that date.
+    date_to_use = preferred_date or state.get("requested_date") or state.get("date")
     slots, used_date = fetch_slots(state["doctor"], state.get("doctor_ar"), date_to_use)
 
     # Fallback: try alternate name combinations if primary query returned nothing
@@ -302,9 +382,15 @@ _TIME_PERIOD_KEYWORDS = {
     "المغرب", "بعد المغرب", "الفجر", "الظهر", "بعد الظهر", "العشاء", "بعد العشاء",
 }
 
-# "Today" / "tomorrow" in Saudi dialect — handled as requested_date, not time filter
+# "Today" / "tomorrow" / weekday names — handled as requested_date, not time filter
 _RELATIVE_DATE_KEYWORDS = {
     "today", "tomorrow", "اليوم", "بكرا", "بكره", "بكرة", "غدا", "غداً",
+    # Weekday names — patient picks a future day explicitly
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "الإثنين", "الاثنين", "الإتنين", "الاتنين",
+    "الثلاثاء", "الثلاثا",
+    "الأربعاء", "الاربعاء", "الأربعا", "الاربعا",
+    "الخميس", "الجمعة", "الجمعه", "السبت", "الأحد", "الاحد",
 }
 
 _TIME_INDICATORS = {
@@ -314,6 +400,42 @@ _TIME_INDICATORS = {
 import re
 # Accept both ASCII and Arabic-Indic digits (٠-٩ are U+0660..U+0669)
 _DIGIT_CLASS = r'[\d\u0660-\u0669]'
+
+from utils.language import normalize_ar as _normalize_ar_for_proposal
+
+# Signals the patient is moving forward (phone, insurance answer, acceptance)
+# while a proposed slot is outstanding. Used to auto-confirm the proposed slot
+# so the flow doesn't stall at "do you want this time?".
+_PROPOSAL_PROCEED_TOKENS = (
+    "yes", "yeah", "yep", "ok", "okay", "sure", "fine", "works", "perfect",
+    "cash", "insurance", "insured",
+    "نعم", "ايوه", "أيوه", "تمام", "ماشي", "مناسب", "موافق", "يناسبني",
+    "كاش", "نقدي", "تامين", "تأمين",
+)
+_PROPOSAL_REJECT_TOKENS = ("no", "not", "don't", "dont", "لا", "مش", "مو", "ما")
+
+
+def _message_accepts_proposal(text: str) -> bool:
+    """True if the message should lock in an outstanding `_proposed_slot`.
+
+    Accepts on: explicit 'yes' tokens, phone numbers, or short cash/insurance
+    answers. Rejects on negations or short digits (new time request).
+    """
+    if not text:
+        return False
+    t = _normalize_ar_for_proposal(text).lower()
+    for neg in _PROPOSAL_REJECT_TOKENS:
+        if re.search(rf"(?<![\w]){re.escape(neg)}(?![\w])", t):
+            return False
+    if re.search(r"\d{7,}", t):
+        return True
+    if re.search(r"(?<!\d)\d{1,2}(?!\d)", t):
+        return False
+    for tok in _PROPOSAL_PROCEED_TOKENS:
+        if re.search(rf"(?<![\w]){re.escape(tok)}(?![\w])", t):
+            return True
+    return False
+
 _TIME_PATTERN = re.compile(
     rf'\b(?:at|after|around|before|بعد|قبل|حوالي|الساعة)\s*{_DIGIT_CLASS}{{1,2}}',
     re.IGNORECASE,
@@ -336,10 +458,6 @@ def _slot_safety_net(state: dict, updates: dict) -> dict:
     if updates.get("_price_handled"):
         return updates
 
-    # Only intervene if LLM didn't already set the right flags
-    if updates.get("wants_more_slots") or updates.get("preferred_time") or updates.get("slots_filter"):
-        return updates
-
     last_msg = get_last_user_message(state)
     if not last_msg:
         return updates
@@ -349,16 +467,41 @@ def _slot_safety_net(state: dict, updates: dict) -> dict:
     # Also keep a digit-normalized copy for regex (preserves Arabic letters)
     msg_digits_ascii = to_ascii_digits(last_msg).lower().strip()
 
-    # Relative-date keyword ("today"/"tomorrow"/"بكرا") → set requested_date, don't filter slots
-    for kw in sorted(_RELATIVE_DATE_KEYWORDS, key=len, reverse=True):
-        if kw in msg_norm:
-            # Translate Saudi tomorrow variants → standard word resolve_relative_date understands
-            if kw in ("بكرا", "بكره", "بكرة", "غدا", "غداً", "tomorrow"):
-                updates["requested_date"] = "tomorrow"
-            else:
-                updates["requested_date"] = "today"
-            state["last_bot_message"] = ""
-            return updates
+    # Relative-date detection runs BEFORE the wants_more_slots/preferred_time
+    # guard. Combined messages like "متاح اليوم؟" / "show today's slots" set
+    # wants_more_slots in the LLM output but often miss requested_date — without
+    # this, the date never switches and the bot displays the prior day's slots
+    # while later confirming the booking for the wrong date.
+    # Pass the original user message to resolve_relative_date so it can match
+    # weekday names and longer phrases ("يوم الخميس", "بكره ان شاء الله").
+    if not updates.get("requested_date"):
+        for kw in sorted(_RELATIVE_DATE_KEYWORDS, key=len, reverse=True):
+            if kw in msg_norm:
+                from utils.datetime_fmt import resolve_relative_date, _ISO_DATE_RE
+                resolved = resolve_relative_date(last_msg)
+                if not _ISO_DATE_RE.match(resolved):
+                    # Fallback for safety — shouldn't happen since the keyword is
+                    # in _RELATIVE_DATE_KEYWORDS and resolve_relative_date knows
+                    # all of them, but keep flow safe rather than passing raw text.
+                    resolved = resolve_relative_date(
+                        "today" if kw in ("today", "اليوم") else "tomorrow"
+                    )
+                updates["requested_date"] = resolved
+                # Mirror into state so _handle_slot_fetch (which prefers the
+                # resolved state value) sees it on this same turn.
+                state["requested_date"] = resolved
+                # Only clear the prior reply if the date actually changed —
+                # otherwise we'd blank out a correct slot_question (already shown
+                # for this date) and fall through to the generic "ما فهمت الوقت"
+                # fallback when the downstream no-op guard skips the refetch.
+                if resolved != state.get("date"):
+                    state["last_bot_message"] = ""
+                break
+
+    # Beyond date detection, intervene only when LLM didn't already set the
+    # other slot flags — otherwise we'd overwrite the LLM's own classification.
+    if updates.get("wants_more_slots") or updates.get("preferred_time") or updates.get("slots_filter"):
+        return updates
 
     # Specific time wins over period-only filter. "8 مساء" / "7 pm" is a
     # specific slot request, not a "show me the evening list" request — check

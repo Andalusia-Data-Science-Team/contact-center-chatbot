@@ -3,27 +3,89 @@
 Shared utilities for LangGraph nodes.
 Centralizes state update logic so every node applies updates consistently.
 """
+import re
+
 from utils.datetime_fmt import resolve_relative_date
 from utils.language import normalize_ar
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+_PLACEHOLDER_FRAGMENTS = (
+    "not collected", "not selected", "not asked", "not determined",
+    "not answered", "not started", "not available",
+)
+
+
+def _is_placeholder_value(v: object) -> bool:
+    """True if the LLM echoed back a state_summary placeholder string.
+
+    The conversation prompt renders unset fields as e.g. "not collected yet — ASK
+    FOR NAME FIRST" so the model knows what to ask. Some LLM responses copy
+    those phrases into state_updates as if they were real values; we should
+    ignore those rather than store a placeholder as a name.
+    """
+    if not isinstance(v, str):
+        return False
+    lo = v.lower()
+    return any(frag in lo for frag in _PLACEHOLDER_FRAGMENTS)
+
+
 def apply_llm_updates(state: dict, updates: dict) -> None:
     """Apply state_updates dict from the conversation LLM to the booking state."""
-    # String fields — set if non-null and non-empty
+    # String fields — set if non-null and non-empty.
+    # `requested_date` handled separately below so we can resolve / guard it.
     STRING_FIELDS = [
         "complaint_text", "speciality", "speciality_ar", "doctor", "doctor_ar",
         "date", "preferred_time", "patient_name", "phone", "insurance_company",
-        "booking_stage", "requested_date",
+        "booking_stage",
     ]
     for f in STRING_FIELDS:
         v = updates.get(f)
-        if v is not None and v not in ("null", ""):
+        if v is not None and v not in ("null", "") and not _is_placeholder_value(v):
             state[f] = v
 
-    # Resolve relative date words to actual YYYY-MM-DD
-    rd = state.get("requested_date", "")
-    if rd and rd not in ("null", ""):
-        state["requested_date"] = resolve_relative_date(rd)
+    # Requested date: resolve relative words ("بكرا", "tomorrow") to YYYY-MM-DD.
+    # Never replace an already-resolved ISO date with raw text the LLM couldn't
+    # resolve — that's how the booking date silently regressed (e.g. N4 t7 went
+    # from "2026-04-27" back to "يوم الخميس" and ended up booked for today).
+    # Also: don't let the LLM silently regress a future date back to today —
+    # the LLM sometimes hallucinates requested_date="today" when the user only
+    # gave a time-of-day hint like "العصر". Require the current user message
+    # to actually mention "today/اليوم/etc." to honour a regression.
+    from datetime import date as _date
+    new_rd = updates.get("requested_date")
+    if new_rd is not None and new_rd not in ("null", ""):
+        resolved = resolve_relative_date(new_rd)
+        accept = False
+        if _ISO_DATE_RE.match(resolved):
+            existing = state.get("requested_date") or ""
+            existing_is_iso = bool(_ISO_DATE_RE.match(existing))
+            if existing_is_iso:
+                try_resolved = _date.fromisoformat(resolved)
+                existing_date = _date.fromisoformat(existing)
+                today = _date.today()
+                # Regression check: future → today. Only honour if the user's
+                # current message actually mentions "today" — otherwise the
+                # LLM is hallucinating a regression from a time-of-day hint.
+                if try_resolved == today and existing_date > today:
+                    last_user = (get_last_user_message(state) or "").lower()
+                    explicit_today = any(
+                        kw in last_user
+                        for kw in ("today", "اليوم", "النهاردة", "النهارده")
+                    )
+                    accept = explicit_today
+                else:
+                    accept = True
+            else:
+                accept = True
+            if accept:
+                state["requested_date"] = resolved
+        elif not _ISO_DATE_RE.match(state.get("requested_date") or ""):
+            # No prior resolved date — keep the raw text so downstream nodes
+            # can still try to interpret it.
+            state["requested_date"] = resolved
 
     # Integer: patient_age
     age = updates.get("patient_age")
@@ -50,6 +112,14 @@ def apply_llm_updates(state: dict, updates: dict) -> None:
     # Safety net: if insured=True but no insurance_company, try to match from user message
     if state.get("insured") is True and not state.get("insurance_company"):
         _try_match_insurance_from_message(state)
+
+    # Inverse safety net: if an insurance company is set, the patient is on
+    # insurance — set insured=True if it wasn't extracted. Without this, the
+    # bot loops asking "cash or insurance?" even after the patient names a
+    # company (e.g. patient says "ميدغولف", company is captured but insured
+    # stays None).
+    if state.get("insurance_company") and state.get("insured") is None:
+        state["insured"] = True
 
     # Populate walk-in (cash) price once per doctor. Track the name we looked up
     # so switching doctors forces a fresh lookup.

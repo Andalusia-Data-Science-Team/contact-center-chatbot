@@ -15,6 +15,29 @@ def _spec_display(specialty_en: str, lang: str) -> str:
     return specialty_en
 
 
+def _ar_day(date_label: str) -> str:
+    """Return a natural Arabic day phrase.
+
+    "اليوم" already contains the word for "the day" — prefixing "يوم اليوم"
+    reads as redundant. For other forms ("بكرا", "الخميس، ٣٠ أبريل") "يوم X"
+    is the natural form.
+    """
+    if date_label == "اليوم":
+        return "اليوم"
+    return f"يوم {date_label}"
+
+
+def _ar_day_for(date_label: str) -> str:
+    """Return a natural Arabic phrase for "for / on {day}" usage.
+
+    Maps "اليوم" → "اليوم" (no preposition needed) and other days to "ليوم X".
+    Used in the doctor list message ("doctors available for {day}").
+    """
+    if date_label == "اليوم":
+        return "اليوم"
+    return f"ليوم {date_label}"
+
+
 def _time_display(t, lang: str) -> str:
     """Format a time value in the right language."""
     if t is None:
@@ -61,12 +84,17 @@ def doctor_list_message(doctors: list, specialty: str, lang: str, date_used: str
 
     body = "\n".join(lines)
     if lang == "ar":
+        day_phrase = _ar_day_for(date_label)
         return (
-            f"تخصص **{spec_name}** — الأطباء المتاحين ليوم {date_label}:\n\n{body}\n\n"
+            f"تخصص **{spec_name}** — الأطباء المتاحين {day_phrase}:\n\n{body}\n\n"
             f"تحب تحجز مع مين؟"
         )
+    if date_label in ("Today", "Tomorrow"):
+        en_date_part = date_label.lower()
+    else:
+        en_date_part = f"on {date_label}"
     return (
-        f"For **{spec_name}** — available doctors on {date_label}:\n\n{body}\n\n"
+        f"For **{spec_name}** — available doctors {en_date_part}:\n\n{body}\n\n"
         f"Which doctor would you prefer?"
     )
 
@@ -107,11 +135,26 @@ def more_slots_message(doctor_en: str, doctor_ar: str, all_slots: list, lang: st
     prefix = "د. " if lang == "ar" else "Dr. "
     lines = [f"{i}. **{format_time(t, lang)}**" for i, (_, t) in enumerate(all_slots, 1)]
     body = "\n".join(lines)
+
+    # Surface the date the slots belong to so a fallback / date-change shift
+    # (e.g. patient asked "متاح اليوم؟" but only tomorrow has openings) is
+    # visible instead of the patient assuming the slots are for today.
+    date_label = ""
+    if all_slots:
+        date_label = format_date(all_slots[0][0], lang)
+
     if lang == "ar":
         period = f" ({filter_label})" if filter_label else ""
-        return f"المواعيد المتاحة لـ{prefix}{doc}{period}:\n\n{body}\n\nأيهم يناسبك؟"
+        date_part = f" {_ar_day_for(date_label)}" if date_label else ""
+        return f"المواعيد المتاحة لـ{prefix}{doc}{date_part}{period}:\n\n{body}\n\nأيهم يناسبك؟"
     period = f" ({filter_label})" if filter_label else ""
-    return f"Available slots for {prefix}{doc}{period}:\n\n{body}\n\nWhich works for you?"
+    if date_label in ("Today", "Tomorrow"):
+        date_part = f" {date_label.lower()}"
+    elif date_label:
+        date_part = f" on {date_label}"
+    else:
+        date_part = ""
+    return f"Available slots for {prefix}{doc}{date_part}{period}:\n\n{body}\n\nWhich works for you?"
 
 
 def slot_confirmed_message(doctor_en: str, doctor_ar: str,
@@ -304,6 +347,9 @@ def confirmation_message(state: dict, lang: str) -> str:
         slot_display = format_time(t_obj, lang)
     except Exception:
         slot_display = slot_raw
+    # Render the actual booked date. `state["date"]` is the date the slots were
+    # fetched for (set by fetch_slots fallback) and is always a YYYY-MM-DD ISO
+    # string — it's the source of truth for what the patient is booked into.
     appt_date = format_date(state.get("date"), lang)
     name = state.get("patient_name", "")
     insured = state.get("insured")

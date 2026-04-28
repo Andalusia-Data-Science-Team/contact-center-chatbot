@@ -36,3 +36,12 @@ env/
 # OS
 Thumbs.db
 desktop.ini
+
+# tests folder
+tests/
+
+# Plan 
+DCC AI Agent Plan.xlsx
+
+#claude
+.claude/

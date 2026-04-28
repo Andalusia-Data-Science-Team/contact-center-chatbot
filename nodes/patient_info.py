@@ -14,6 +14,9 @@ def patient_info_node(state: BookingState) -> BookingState:
     """Check completeness and produce final confirmation or ask for missing info."""
     stage = state.get("booking_stage")
 
+    if stage in ("cancelled", "callback_pending"):
+        return state
+
     # Only act on complete or patient_info stages
     if stage not in ("complete", "patient_info"):
         return state

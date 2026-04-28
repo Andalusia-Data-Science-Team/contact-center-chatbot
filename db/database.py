@@ -202,15 +202,26 @@ def query_availability_with_fallback(
     specialty_ar: str = None,
     doctor_en: str = None,
     doctor_ar: str = None,
+    preferred_date: str = None,
     max_days_ahead: int = 7,
 ) -> tuple[list[dict], str]:
     """
-    Try today first, then search forward up to max_days_ahead.
+    Try preferred_date first (or today), then search forward up to max_days_ahead.
     Returns (rows, date_used_iso).
     """
-    today = date.today()
+    start = date.today()
+    if preferred_date:
+        try:
+            start = datetime.strptime(preferred_date, "%Y-%m-%d").date()
+            # Never search in the past — a stale requested_date would otherwise
+            # silently downgrade to today's results.
+            if start < date.today():
+                start = date.today()
+        except (ValueError, TypeError):
+            pass
+
     for offset in range(max_days_ahead + 1):
-        check_date = today + timedelta(days=offset)
+        check_date = start + timedelta(days=offset)
         date_str = check_date.strftime("%Y-%m-%d")
         rows = query_availability(
             report_date=date_str,
@@ -221,7 +232,7 @@ def query_availability_with_fallback(
         )
         if rows:
             return rows, date_str
-    return [], today.strftime("%Y-%m-%d")
+    return [], start.strftime("%Y-%m-%d")
 
 
 def query_doctor_slots(

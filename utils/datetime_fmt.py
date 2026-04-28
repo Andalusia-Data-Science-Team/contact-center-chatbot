@@ -1,5 +1,9 @@
 # utils/datetime_fmt.py
+import re
 from datetime import date, datetime, timedelta
+
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # ── Arabic day and month names ──
@@ -92,20 +96,66 @@ def today_iso() -> str:
     return date.today().strftime("%Y-%m-%d")
 
 
+_WEEKDAY_OFFSETS = {
+    # English
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    # Arabic — both common spellings
+    "الإثنين": 0, "الاثنين": 0, "الإتنين": 0, "الاتنين": 0,
+    "الثلاثاء": 1, "الثلاثا": 1,
+    "الأربعاء": 2, "الاربعاء": 2, "الأربعا": 2, "الاربعا": 2,
+    "الخميس": 3,
+    "الجمعة": 4, "الجمعه": 4,
+    "السبت": 5,
+    "الأحد": 6, "الاحد": 6,
+}
+
+_TOMORROW_WORDS = ("tomorrow", "غداً", "غدا", "بكرا", "بكره", "بكرة")
+_TODAY_WORDS = ("today", "اليوم", "النهاردة", "النهارده")
+_DAY_AFTER_WORDS = ("day after tomorrow", "بعد غد", "بعد غداً", "بعد بكرا", "بعد بكره")
+
+
 def resolve_relative_date(raw: str) -> str:
-    """Convert 'tomorrow', 'بكرا', etc. to YYYY-MM-DD. Pass through if already formatted."""
+    """Convert 'tomorrow', 'بكرا', 'يوم الخميس', etc. to YYYY-MM-DD.
+
+    Matches keywords inside longer phrases — patients say "بكره ان شاء الله"
+    or "بكرا إن شاء الله يكون مناسباً", not just "بكرا" by itself.
+    Pass through unchanged if no keyword found.
+    """
     from datetime import date, timedelta
+
+    if not raw:
+        return raw
 
     today = date.today()
     r = raw.strip().lower()
 
-    tomorrow_words = {"tomorrow", "غداً", "غدا", "بكرا", "بكره"}
-    day_after_words = {"day after tomorrow", "بعد غد", "بعد غداً"}
+    if _ISO_DATE_RE.match(r):
+        return r
 
-    if r in tomorrow_words:
-        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    if r in day_after_words:
-        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
-    if r == "today":
-        return today.strftime("%Y-%m-%d")
+    # Day-after first (longer phrases beat shorter ones — "بعد بكرا" must match
+    # before "بكرا" matches the same string).
+    for kw in _DAY_AFTER_WORDS:
+        if kw in r:
+            return (today + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    for kw in _TOMORROW_WORDS:
+        if kw in r:
+            return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    for kw in _TODAY_WORDS:
+        if kw in r:
+            return today.strftime("%Y-%m-%d")
+
+    # Weekday names → next occurrence of that weekday (today counts only if
+    # explicitly mentioned alongside "today", which the loop above already
+    # handled).
+    for name, target_dow in _WEEKDAY_OFFSETS.items():
+        if name in r:
+            current_dow = today.weekday()
+            days_ahead = (target_dow - current_dow) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # "Thursday" said on Thursday → next Thursday
+            return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
     return raw

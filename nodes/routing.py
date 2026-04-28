@@ -68,6 +68,8 @@ def routing_node(state: BookingState) -> BookingState:
     """
     lang = state.get("language", "en")
 
+    if state.get("booking_stage") in ("cancelled", "callback_pending"):
+        return state
     if state.get("booking_stage") != "routing":
         return state
     if not state.get("complaint_text"):
@@ -142,9 +144,14 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
     state["speciality"] = specialty
     state["speciality_confidence"] = result["confidence"]
 
-    # Ask patient to confirm the specialty before showing doctors
+    # Ask patient to confirm the specialty before showing doctors.
+    # If the patient already mentioned a date ("بكرا"), reflect it in the prompt
+    # so the question doesn't say "today" when we're going to query tomorrow.
+    # Default to today if neither requested_date nor date is set yet.
+    from utils.datetime_fmt import today_iso
     patient = state.get("patient_name", "")
-    today_label = format_date(state.get("date"), lang)
+    date_for_label = state.get("requested_date") or state.get("date") or today_iso()
+    date_label = format_date(date_for_label, lang)
 
     # Show specialty in patient's language
     from config.constants import SPECIALTY_EN_TO_AR
@@ -154,12 +161,12 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
         name_part = f" أ/ {patient}" if patient else ""
         state["last_bot_message"] = (
             f"تمام{name_part}، حضرتك محتاج تخصص **{spec_display}**. "
-            f"تبغى أعرض لك الأطباء المتاحين اليوم؟"
+            f"تبغى أعرض لك الأطباء المتاحين {date_label}؟"
         )
     else:
         state["last_bot_message"] = (
             f"Based on what you've described, you'll need **{spec_display}**. "
-            f"Would you like to see the available doctors for today?"
+            f"Would you like to see the available doctors for {date_label}?"
         )
     return state
 
@@ -209,7 +216,10 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
         state["specialty_confirmed"] = True
         specialty = state.get("speciality") or state.get("speciality_ar") or ""
 
-        doctors, used_date = fetch_doctors(specialty, lang, state.get("date"))
+        # Honour requested_date if the patient said "بكرا" / "يوم الخميس" before
+        # confirming the specialty. Falls back to today's context otherwise.
+        preferred = state.get("requested_date") or state.get("date")
+        doctors, used_date = fetch_doctors(specialty, lang, preferred)
         state["date"] = used_date
         state["available_doctors"] = doctors
 
@@ -282,6 +292,7 @@ def _is_direct_specialty_request(complaint: str) -> bool:
         "nephrology", "kidney", "oncology", "nutrition", "nutritionist",
         "physiotherapy", "physical therapy", "plastic surgery", "cosmetic",
         "internal medicine", "family medicine", "general surgery",
+        "ivf", "icsi", "fertility", "infertility", "test tube",
     }
     direct_keywords_ar = {
         "جلدية", "أسنان", "اسنان", "عيون", "أنف وأذن", "انف واذن",
@@ -290,6 +301,10 @@ def _is_direct_specialty_request(complaint: str) -> bool:
         "جهاز هضمي", "صدرية", "كلى", "أورام", "تغذية",
         "علاج طبيعي", "تجميل", "جراحة", "أسرة",
         "تقويم", "جذور", "جلد",
+        # IVF / fertility — must skip the generic-injection triage that the
+        # word "حقن" alone otherwise triggers.
+        "حقن مجهري", "حقن مجهرى", "اطفال انابيب", "أطفال أنابيب",
+        "تلقيح صناعي", "تلقيح", "عقم", "تأخر حمل", "تاخر حمل",
     }
 
     lower = complaint.lower().strip()
