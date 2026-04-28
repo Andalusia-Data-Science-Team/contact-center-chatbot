@@ -36,6 +36,13 @@ def slot_selection_node(state: BookingState) -> BookingState:
     if stage in ("cancelled", "callback_pending"):
         return state
 
+    # Doctor was just picked by bare digit this turn (e.g. "2" at doctor_list).
+    # The LLM and the slot safety net both treat that digit as a time, which
+    # would overwrite the slot_question reply with "ما فهمت الوقت". Skip the
+    # whole node for this turn — the patient hasn't expressed any time intent.
+    if state.pop("_skip_time_preference_this_turn", False):
+        return state
+
     # Must be in an active booking with a doctor to do anything here
     if not state.get("doctor"):
         return state
@@ -331,10 +338,12 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
     from services.slot_handler import get_initial_slots
     from services.formatter import slot_question
     from db.database import query_doctor_slots_with_fallback
+    from nodes.doctor_selection import _fallback_notice
 
     # Mirrors doctor_selection._handle_slot_fetch: honour requested_date so a
     # mid-flow date change ("ابغى يوم بكرا") actually refetches for that date.
-    date_to_use = preferred_date or state.get("requested_date") or state.get("date")
+    explicit_requested = preferred_date or state.get("requested_date")
+    date_to_use = explicit_requested or state.get("date")
     slots, used_date = fetch_slots(state["doctor"], state.get("doctor_ar"), date_to_use)
 
     # Fallback: try alternate name combinations if primary query returned nothing
@@ -369,7 +378,10 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
 
     slot_info = get_initial_slots(slots)
     state["booking_stage"] = "slot_selection"
-    return slot_question(state["doctor"], state.get("doctor_ar", ""), slot_info, lang)
+    fallback_prefix = _fallback_notice(explicit_requested, used_date, lang)
+    return fallback_prefix + slot_question(
+        state["doctor"], state.get("doctor_ar", ""), slot_info, lang,
+    )
 
 
 # ── Safety net: catch slot requests the LLM missed ──────────────────────────

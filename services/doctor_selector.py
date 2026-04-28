@@ -60,7 +60,7 @@ def match_doctor(raw_input: str, available_doctors: list) -> dict:
 
     by_number = _pick_by_number(raw_input, available_doctors)
     if by_number:
-        return {"status": "matched", "doctor": by_number}
+        return {"status": "matched", "doctor": by_number, "matched_by": "number"}
 
     words = raw_input.split()
     cleaned = " ".join(w for w in words if w.lower().strip(".,?!؟") not in NAME_STOPWORDS)

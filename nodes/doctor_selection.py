@@ -3,14 +3,22 @@
 Handles doctor matching from patient input and fetching their available slots.
 """
 from state import BookingState
+from nodes._helpers import get_last_user_message
 from services.doctor_selector import match_doctor, fetch_slots
 from services.slot_handler import get_initial_slots
 from services.formatter import (
     slot_question, doctor_confirm_message,
     doctor_not_found_message,
 )
-from utils.datetime_fmt import format_date, format_time
+from utils.datetime_fmt import format_date, format_time, _ISO_DATE_RE
 from utils.language import normalize_ar
+
+
+# Date keywords we deterministically catch at the doctor_list stage when the
+# LLM misses extracting requested_date (e.g. "متاح غدا؟").
+_DOCTOR_LIST_DATE_KEYWORDS = (
+    "اليوم", "بكرا", "بكره", "بكرة", "غدا", "غداً", "today", "tomorrow",
+)
 
 
 def doctor_selection_node(state: BookingState) -> BookingState:
@@ -18,6 +26,8 @@ def doctor_selection_node(state: BookingState) -> BookingState:
     Processes doctor selection:
     - If patient typed a doctor name → fuzzy match it
     - If doctor is confirmed and slots are needed → fetch slots
+    - At doctor_list stage, deterministically handle bare digits (pick by number)
+      and date keywords (refetch list) when the LLM misses them
     """
     lang = state.get("language", "en")
     updates = state.get("_llm_updates") or {}
@@ -51,6 +61,57 @@ def doctor_selection_node(state: BookingState) -> BookingState:
     if updates.get("needs_slot_query") and state.get("doctor"):
         state["last_bot_message"] = _handle_slot_fetch(state, lang)
         return state
+
+    # Case 3: Doctor-list safety nets. The LLM mis-classifies bare digits ("4")
+    # as time inputs and silently drops date keywords like "متاح غدا؟" — handle
+    # both here deterministically before any later node treats "4" as a time.
+    if (state.get("booking_stage") == "doctor_list"
+            and not state.get("doctor")
+            and state.get("available_doctors")):
+        last_msg = (get_last_user_message(state) or "").strip()
+
+        # 3a: Bare digit → pick that doctor by index
+        if last_msg.isdigit():
+            idx = int(last_msg) - 1
+            if 0 <= idx < len(state["available_doctors"]):
+                doc = state["available_doctors"][idx]
+                state["doctor"] = doc.get("Doctor", "")
+                state["doctor_ar"] = doc.get("DoctorAR", "")
+                state["walk_in_price"] = doc.get("WalkInPrice")
+                # Tell slot_selection_node not to re-process the digit as a time.
+                # Without this, _slot_safety_net catches "2" as a bare time and
+                # _handle_time_preference replies "ما فهمت الوقت", overwriting
+                # the slot_question we just generated.
+                state["_skip_time_preference_this_turn"] = True
+                state["last_bot_message"] = _handle_slot_fetch(state, lang)
+                return state
+
+        # 3b: Date keyword → refetch doctor list for the new date
+        new_date = state.get("requested_date")
+        if not (new_date and _ISO_DATE_RE.match(new_date)):
+            # apply_llm_updates didn't capture it — scan the message ourselves
+            msg_norm = normalize_ar(last_msg)
+            if any(kw in msg_norm for kw in _DOCTOR_LIST_DATE_KEYWORDS):
+                from utils.datetime_fmt import resolve_relative_date
+                resolved = resolve_relative_date(last_msg)
+                if _ISO_DATE_RE.match(resolved):
+                    new_date = resolved
+                    state["requested_date"] = resolved
+
+        if new_date and _ISO_DATE_RE.match(new_date) and new_date != state.get("date"):
+            from services.doctor_selector import fetch_doctors
+            from services.formatter import doctor_list_message, no_doctors_message
+            specialty = state.get("speciality") or state.get("speciality_ar") or ""
+            doctors, used_date = fetch_doctors(specialty, lang, new_date)
+            state["date"] = used_date
+            state["available_doctors"] = doctors
+            if doctors:
+                state["last_bot_message"] = doctor_list_message(
+                    doctors, specialty, lang, used_date,
+                )
+            else:
+                state["last_bot_message"] = no_doctors_message(specialty, lang)
+            return state
 
     return state
 
@@ -121,6 +182,8 @@ def _handle_doctor_match(raw_input: str, state: dict, lang: str) -> str:
         state["doctor"] = doc.get("Doctor", "")
         state["doctor_ar"] = doc.get("DoctorAR", "")
         state["walk_in_price"] = doc.get("WalkInPrice")
+        if m.get("matched_by") == "number":
+            state["_skip_time_preference_this_turn"] = True
         return _handle_slot_fetch(state, lang)
 
     if m["status"] == "confirm":
@@ -274,7 +337,8 @@ def _handle_direct_doctor_lookup(raw_input: str, state: dict, lang: str) -> str:
 def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> str:
     # Honour the patient's requested date (e.g. "بكرا") if they gave one before
     # the slot lookup — otherwise use the current date context.
-    date_to_use = preferred_date or state.get("requested_date") or state.get("date")
+    explicit_requested = preferred_date or state.get("requested_date")
+    date_to_use = explicit_requested or state.get("date")
     slots, used_date = fetch_slots(state["doctor"], state.get("doctor_ar"), date_to_use)
 
     # Fallback: if DB slot query returned nothing but we have availability data,
@@ -309,7 +373,31 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
         "date": slot_info["first_date"].strftime("%Y-%m-%d"),
         "date_display": format_date(slot_info["first_date"], lang),
     }
-    return slot_question(state["doctor"], state.get("doctor_ar", ""), slot_info, lang)
+    fallback_prefix = _fallback_notice(explicit_requested, used_date, lang)
+    return fallback_prefix + slot_question(
+        state["doctor"], state.get("doctor_ar", ""), slot_info, lang,
+    )
+
+
+def _fallback_notice(requested: str, used_date: str, lang: str) -> str:
+    """Return a leading sentence when the slot fetch silently shifted the day.
+
+    Without this, the patient asks "متاح غدا؟" and the bot replies with
+    "يوم الخميس، ٣٠ أبريل" — looking like a hallucination — when really
+    tomorrow had no openings and the fallback jumped ahead.
+    """
+    if not requested or not used_date or requested == used_date:
+        return ""
+    try:
+        from datetime import datetime
+        req_dt = datetime.strptime(requested, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return ""
+    req_label = format_date(req_dt, lang)
+    if lang == "ar":
+        return f"للأسف ما في مواعيد متاحة {req_label}. "
+    en_label = req_label.lower() if req_label in ("Today", "Tomorrow") else f"on {req_label}"
+    return f"No slots available {en_label}. "
 
 
 def _extract_slots_from_availability(state: dict) -> list:

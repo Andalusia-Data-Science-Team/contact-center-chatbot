@@ -275,6 +275,13 @@ def conversation_node(state: BookingState) -> BookingState:
     if state.get("booking_stage") in ("patient_info", "complete") and not state.get("selected_slot"):
         state["booking_stage"] = "slot_selection" if state.get("doctor") else "doctor_list"
 
+    # Guard: never jump to slot_selection without a doctor. The LLM sometimes
+    # advances the stage when the patient sends a bare number ("4") at
+    # doctor_list — that number is a doctor index, not a time. Push back so
+    # doctor_selection_node's pick-by-number safety net can run.
+    if state.get("booking_stage") == "slot_selection" and not state.get("doctor"):
+        state["booking_stage"] = "doctor_list" if state.get("available_doctors") else "complaint"
+
     # Guard: never jump past routing while a specialty is set but unconfirmed.
     # Without this, "بعد المغرب" after the specialty-confirmation question
     # makes the LLM set booking_stage=slot_selection directly, skipping the

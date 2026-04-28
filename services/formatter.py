@@ -18,23 +18,24 @@ def _spec_display(specialty_en: str, lang: str) -> str:
 def _ar_day(date_label: str) -> str:
     """Return a natural Arabic day phrase.
 
-    "اليوم" already contains the word for "the day" — prefixing "يوم اليوم"
-    reads as redundant. For other forms ("بكرا", "الخميس، ٣٠ أبريل") "يوم X"
-    is the natural form.
+    "اليوم" / "غدا" stand on their own — prefixing "يوم اليوم" or "يوم غدا"
+    reads as redundant. For other forms (e.g. "الخميس، ٣٠ أبريل") "يوم X" is
+    the natural form.
     """
-    if date_label == "اليوم":
-        return "اليوم"
+    if date_label in ("اليوم", "غدا"):
+        return date_label
     return f"يوم {date_label}"
 
 
 def _ar_day_for(date_label: str) -> str:
     """Return a natural Arabic phrase for "for / on {day}" usage.
 
-    Maps "اليوم" → "اليوم" (no preposition needed) and other days to "ليوم X".
-    Used in the doctor list message ("doctors available for {day}").
+    Maps "اليوم" → "اليوم" and "غدا" → "غدا" (no preposition needed) and
+    other days to "ليوم X". Used in the doctor list message
+    ("doctors available for {day}").
     """
-    if date_label == "اليوم":
-        return "اليوم"
+    if date_label in ("اليوم", "غدا"):
+        return date_label
     return f"ليوم {date_label}"
 
 
@@ -119,8 +120,9 @@ def slot_question(doctor_en: str, doctor_ar: str, slot_info: dict, lang: str) ->
     first_time = format_time(slot_info["first_time"], lang)
 
     if lang == "ar":
+        day_phrase = _ar_day(date_label)
         return (
-            f"أقرب موعد مع **{prefix}{doc}** يوم {date_label} الساعة **{first_time}**.\n\n"
+            f"أقرب موعد مع **{prefix}{doc}** {day_phrase} الساعة **{first_time}**.\n\n"
             f"مناسب لحضرتك؟ أو قولي الوقت اللي يناسبك."
         )
     return (
@@ -169,7 +171,7 @@ def slot_confirmed_message(doctor_en: str, doctor_ar: str,
                 f"مناسب؟ لو أيوه، ممكن رقم جوالك وكاش ام تأمين؟"
             )
         return (
-            f"تمام، موعدك مع {prefix}{doc} يوم {slot_date} الساعة {slot_time}.\n\n"
+            f"تمام، موعدك مع {prefix}{doc} {_ar_day(slot_date)} الساعة {slot_time}.\n\n"
             f"ممكن رقم جوالك؟ وكاش ام تأمين؟"
         )
     if is_fallback:
@@ -364,7 +366,7 @@ def confirmation_message(state: dict, lang: str) -> str:
             f"📋 **تفاصيل الموعد:**\n"
             f"👨‍⚕️ مع {prefix}{doc}\n"
             f"🏥 عيادة {spec}\n"
-            f"📅 يوم {appt_date}\n"
+            f"📅 {_ar_day(appt_date)}\n"
             f"🕐 الساعة {slot_display}\n"
             f"💳 {ins_text}"
             f"{price_line}\n\n"
