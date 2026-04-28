@@ -218,11 +218,10 @@ def _confirm_initial_slot(state: dict, slot_info: dict, lang: str) -> BookingSta
     patient = state.get("patient_name", "")
 
     if lang == "ar":
-        # Real agent style: confirm slot then ask for phone + insurance
-        patient_greeting = f" أ/ {patient}" if patient else ""
-        state["last_bot_message"] = (
-            f"تمام{patient_greeting}، موعدك مع {prefix}{name} يوم {date_str} الساعة {time_str}.\n\n"
-            f"ممكن رقم جوالك؟ وكاش ام تأمين؟"
+        # Defer to slot_confirmed_message so this confirm-via-acceptance path
+        # stays in lockstep with the time-preference confirm path.
+        state["last_bot_message"] = slot_confirmed_message(
+            doc, doc_ar, date_str, time_str, lang, is_fallback=False,
         )
     else:
         patient_greeting = f"{patient}, " if patient else ""

@@ -171,8 +171,8 @@ def slot_confirmed_message(doctor_en: str, doctor_ar: str,
                 f"مناسب؟ لو أيوه، ممكن رقم جوالك وكاش ام تأمين؟"
             )
         return (
-            f"تمام، موعدك مع {prefix}{doc} {_ar_day(slot_date)} الساعة {slot_time}.\n\n"
-            f"ممكن رقم جوالك؟ وكاش ام تأمين؟"
+            f"تمام، لتأكيد الحجز مع {prefix}{doc} {_ar_day(slot_date)} الساعة {slot_time}، "
+            f"نرجو تزويدنا برقم الجوال، وهل ستكون الزيارة كاش أم تأمين؟"
         )
     if is_fallback:
         return (
