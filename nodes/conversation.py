@@ -282,15 +282,16 @@ def conversation_node(state: BookingState) -> BookingState:
     if state.get("booking_stage") == "slot_selection" and not state.get("doctor"):
         state["booking_stage"] = "doctor_list" if state.get("available_doctors") else "complaint"
 
-    # Guard: never jump past routing while a specialty is set but unconfirmed.
-    # Without this, "بعد المغرب" after the specialty-confirmation question
-    # makes the LLM set booking_stage=slot_selection directly, skipping the
-    # routing node's implicit-accept path and leaving no doctors loaded.
+    # Guard: while a specialty is set but unconfirmed and no doctors are loaded,
+    # routing owns the flow. Force stage back to "routing" to block both forward
+    # jumps ("بعد المغرب" → slot_selection skipping the implicit-accept path) and
+    # backward regressions ("نعم" → complaint, which short-circuits routing_node
+    # and leaves the safety net to ask for the complaint a second time).
     if (
-        state.get("booking_stage") in ("doctor_list", "slot_selection", "patient_info", "complete")
-        and state.get("speciality")
+        state.get("speciality")
         and not state.get("specialty_confirmed")
         and not state.get("available_doctors")
+        and state.get("booking_stage") != "routing"
     ):
         state["booking_stage"] = "routing"
 

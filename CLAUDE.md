@@ -18,7 +18,7 @@ Runs as a Streamlit web app. Deployed at `http://10.24.105.220:8502` (company ne
 
 - **Agent name:** Nour (نور)
 - **Languages:** Arabic (Saudi + Egyptian dialects) and English
-- **LLM:** Fireworks AI, Llama 3.3 70B Instruct
+- **LLM:** OpenRouter, Llama 3.3 70B Instruct
 
 ---
 
@@ -26,7 +26,7 @@ Runs as a Streamlit web app. Deployed at `http://10.24.105.220:8502` (company ne
 
 - **Frontend:** Streamlit (chat UI with dev/stakeholder toggle)
 - **Orchestration:** LangGraph (8-node sequential pipeline)
-- **LLM:** Fireworks AI (`accounts/fireworks/models/llama-v3p3-70b-instruct`)
+- **LLM:** OpenRouter (`meta-llama/llama-3.3-70b-instruct`)
 - **Database:** Microsoft SQL Server (hospital booking system) via pyodbc + ODBC Driver 17
 - **Fuzzy matching:** rapidfuzz (doctor names + insurance companies)
 - **Config:** `.env` file loaded via python-dotenv
@@ -170,7 +170,7 @@ The conversation prompt (line 108-140) has strict rules: LLM must return `reply:
 - Per booking (10-15 turns): ~33,000 tokens, ~$0.003-0.005
 - Conversation LLM (each turn): ~2,300 tokens (biggest cost — system prompt is ~1,800 tokens)
 - Intent classifier: ~500 tokens per turn (often hard-locked mid-booking)
-- LLM pricing: $0.90/M input, $0.90/M output (Fireworks Llama 3.3 70B)
+- LLM pricing: $0.90/M input, $0.90/M output (OpenRouter Llama 3.3 70B)
 
 ---
 

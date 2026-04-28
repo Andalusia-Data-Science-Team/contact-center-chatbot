@@ -2,10 +2,10 @@
 # ─── External service credentials & tunable thresholds ───
 import os
 
-# --- Fireworks LLM ---
-FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
-FIREWORKS_MODEL = os.getenv("FIREWORKS_MODEL", "accounts/fireworks/models/llama-v3p3-70b-instruct")
-FIREWORKS_BASE_URL = os.getenv("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1")
+# --- OpenRouter LLM ---
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # --- SQL Server ---
 DB_DRIVER = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
@@ -39,6 +39,6 @@ PEDIATRIC_AGE_THRESHOLD = 10
 # "dev"         = developer UI with token counts, latency, cost tracking
 VIEW_MODE = os.getenv("VIEW_MODE", "stakeholder")
 
-# --- LLM Pricing (per 1M tokens, Fireworks Llama 3.3 70B) ---
+# --- LLM Pricing (per 1M tokens, OpenRouter Llama 3.3 70B) ---
 LLM_INPUT_PRICE_PER_M = 0.90    # $0.90 per 1M input tokens
 LLM_OUTPUT_PRICE_PER_M = 0.90   # $0.90 per 1M output tokens

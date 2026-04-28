@@ -84,7 +84,7 @@ try:
     print(f'   ✅ LLM connection successful: {result[:50]}')
 except Exception as e:
     print(f'   ❌ LLM connection failed: {e}')
-    print('   Check FIREWORKS_API_KEY in .env file and internet access')
+    print('   Check OPENROUTER_API_KEY in .env file and internet access')
 "
 
 # ── 6. Create systemd service (runs on boot) ────────────────

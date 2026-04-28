@@ -3,7 +3,7 @@ import json
 import re
 import time
 import requests
-from config.settings import FIREWORKS_API_KEY, FIREWORKS_MODEL, FIREWORKS_BASE_URL
+from config.settings import OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL
 
 # ── Global metrics accumulator (reset per turn by app.py) ──
 _turn_metrics = {
@@ -38,13 +38,13 @@ def call_llm(
     label: str = "llm_call",
 ) -> str | dict:
     """
-    Call Fireworks LLM.
+    Call OpenRouter LLM.
     Returns the assistant reply as a string.
     If json_mode=True, returns parsed JSON dict.
     Tracks token usage and latency in _turn_metrics.
     """
     headers = {
-        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -54,7 +54,7 @@ def call_llm(
     payload_messages.extend(messages)
 
     payload = {
-        "model": FIREWORKS_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": payload_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -77,7 +77,7 @@ def call_llm(
     for attempt in range(3):
         try:
             response = requests.post(
-                f"{FIREWORKS_BASE_URL}/chat/completions",
+                f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=30,
