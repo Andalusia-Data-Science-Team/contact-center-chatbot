@@ -538,11 +538,18 @@ def _reshow_doctor_list_for_date(state: dict, raw_msg: str, lang: str):
     state["available_doctors"] = doctors
     state["booking_stage"] = "doctor_list"
     if doctors:
-        state["last_bot_message"] = doctor_list_message(
-            doctors, specialty, lang, used_date,
-        )
-        from nodes.doctor_selection import auto_select_if_single_doctor
-        auto_select_if_single_doctor(state, doctors)
+        if len(doctors) == 1:
+            only = doctors[0]
+            state["doctor"] = only.get("Doctor", "") or ""
+            state["doctor_ar"] = only.get("DoctorAR", "") or ""
+            if only.get("WalkInPrice") is not None:
+                state["walk_in_price"] = only.get("WalkInPrice")
+            from nodes.doctor_selection import _handle_slot_fetch
+            state["last_bot_message"] = _handle_slot_fetch(state, lang)
+        else:
+            state["last_bot_message"] = doctor_list_message(
+                doctors, specialty, lang, used_date,
+            )
     elif strict:
         state["last_bot_message"] = no_doctors_on_date_message(
             specialty, target_date, lang,

@@ -170,13 +170,12 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
     state["speciality_confidence"] = result["confidence"]
 
     # Ask patient to confirm the specialty before showing doctors.
-    # If the patient already mentioned a date ("بكرا"), reflect it in the prompt
-    # so the question doesn't say "today" when we're going to query tomorrow.
-    # Default to today if neither requested_date nor date is set yet.
-    from utils.datetime_fmt import today_iso
+    # Only mention a date when the patient already said one — without an
+    # explicit ask, we don't know yet what's available, so promising "today"
+    # would be a lie when only later days have openings.
     patient = state.get("patient_name", "")
-    date_for_label = state.get("requested_date") or state.get("date") or today_iso()
-    date_label = format_date(date_for_label, lang)
+    explicit_date = state.get("requested_date") or state.get("date")
+    date_label = format_date(explicit_date, lang) if explicit_date else ""
 
     # Show specialty in patient's language
     from config.constants import SPECIALTY_EN_TO_AR
@@ -184,14 +183,16 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
 
     if lang == "ar":
         name_part = f" أ/ {patient}" if patient else ""
+        date_suffix = f" {date_label}" if date_label else ""
         state["last_bot_message"] = (
             f"تمام{name_part}، حضرتك محتاج تخصص **{spec_display}**. "
-            f"تبغى أعرض لك الأطباء المتاحين {date_label}؟"
+            f"تبغى أعرض لك الأطباء المتاحين{date_suffix}؟"
         )
     else:
+        date_suffix = f" for {date_label}" if date_label else ""
         state["last_bot_message"] = (
             f"Based on what you've described, you'll need **{spec_display}**. "
-            f"Would you like to see the available doctors for {date_label}?"
+            f"Would you like to see the available doctors{date_suffix}?"
         )
     return state
 
@@ -271,10 +272,21 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
         state["available_doctors"] = doctors
 
         if doctors:
-            state["booking_stage"] = "doctor_list"
-            state["last_bot_message"] = doctor_list_message(doctors, specialty, lang, used_date)
-            from nodes.doctor_selection import auto_select_if_single_doctor
-            auto_select_if_single_doctor(state, doctors)
+            if len(doctors) == 1:
+                # Skip the "which doctor?" CTA when there's only one option —
+                # auto-pick them and jump straight to the slot proposal. The
+                # slot_question already names the doctor, so the patient still
+                # sees who they're booking with.
+                only = doctors[0]
+                state["doctor"] = only.get("Doctor", "") or ""
+                state["doctor_ar"] = only.get("DoctorAR", "") or ""
+                if only.get("WalkInPrice") is not None:
+                    state["walk_in_price"] = only.get("WalkInPrice")
+                from nodes.doctor_selection import _handle_slot_fetch
+                state["last_bot_message"] = _handle_slot_fetch(state, lang)
+            else:
+                state["booking_stage"] = "doctor_list"
+                state["last_bot_message"] = doctor_list_message(doctors, specialty, lang, used_date)
         elif strict:
             # Specialty exists but has nothing on the requested day. Stay in
             # routing so the patient can pick a different date — don't drop

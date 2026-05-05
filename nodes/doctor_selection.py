@@ -140,10 +140,17 @@ def doctor_selection_node(state: BookingState) -> BookingState:
             state["date"] = used_date
             state["available_doctors"] = doctors
             if doctors:
-                state["last_bot_message"] = doctor_list_message(
-                    doctors, specialty, lang, used_date,
-                )
-                auto_select_if_single_doctor(state, doctors)
+                if len(doctors) == 1:
+                    only = doctors[0]
+                    state["doctor"] = only.get("Doctor", "") or ""
+                    state["doctor_ar"] = only.get("DoctorAR", "") or ""
+                    if only.get("WalkInPrice") is not None:
+                        state["walk_in_price"] = only.get("WalkInPrice")
+                    state["last_bot_message"] = _handle_slot_fetch(state, lang)
+                else:
+                    state["last_bot_message"] = doctor_list_message(
+                        doctors, specialty, lang, used_date,
+                    )
             else:
                 state["last_bot_message"] = no_doctors_on_date_message(
                     specialty, new_date, lang,
