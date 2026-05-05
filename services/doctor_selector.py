@@ -19,24 +19,74 @@ NAME_STOPWORDS = {
 }
 
 
-def fetch_doctors(specialty: str, lang: str, preferred_date: str = None) -> tuple:
+def fetch_doctors(
+    specialty: str,
+    lang: str,
+    preferred_date: str = None,
+    strict_date: bool = False,
+) -> tuple:
     """
     Query DB for doctors in the given specialty.
     Returns (doctor_list, date_used). Filters out doctors with no slot data.
     Note: routing now always returns EN specialty names, so try EN first regardless of lang.
+
+    When `strict_date` is True, the search is constrained to `preferred_date`
+    only — no forward fallback. Used when the patient explicitly asked for a
+    specific day ("اليوم", "يوم الخميس") so we don't silently shift to a later
+    day they didn't ask about.
     """
+    max_days = 0 if strict_date else 7
     # Always try EN first (routing returns EN names)
     rows, used_date = query_availability_with_fallback(
-        specialty_en=specialty, specialty_ar=None, preferred_date=preferred_date,
+        specialty_en=specialty, specialty_ar=None,
+        preferred_date=preferred_date, max_days_ahead=max_days,
     )
     # Fallback: try as AR name in case it's an AR specialty somehow
     if not rows:
         rows, used_date = query_availability_with_fallback(
-            specialty_en=None, specialty_ar=specialty, preferred_date=preferred_date,
+            specialty_en=None, specialty_ar=specialty,
+            preferred_date=preferred_date, max_days_ahead=max_days,
         )
 
     doctors = aggregate_doctor_slots(rows)
     doctors = [d for d in doctors if d.get("Nearest_Date") and d.get("Nearest_Time")]
+
+    # FreeSlotsRanked is now bound to @ReportDate at the SQL level, so all
+    # surviving rows already have Nearest_Date == @ReportDate. This block is
+    # kept as a defensive anchor: if any row leaks through with a different
+    # date (e.g. data inconsistency), drop it instead of letting the header
+    # label and per-doctor times disagree.
+    if doctors:
+        from datetime import date as _date
+
+        def _to_date(nd):
+            if hasattr(nd, "isoformat"):  # datetime.date
+                return nd if not hasattr(nd, "hour") else nd.date()
+            if isinstance(nd, str) and len(nd) >= 10:
+                try:
+                    return _date.fromisoformat(nd[:10])
+                except ValueError:
+                    return None
+            return None
+
+        slot_dates = [d for d in (_to_date(doc.get("Nearest_Date")) for doc in doctors) if d]
+        if slot_dates:
+            real_earliest = min(slot_dates)
+            # In strict_date mode, anchor to the requested day instead of the
+            # min — the FreeSlotsRanked CTE picks each doctor's earliest free
+            # slot across ALL future dates, so a doctor scheduled to work today
+            # but already fully booked still surfaces with Nearest_Date=tomorrow.
+            # Honouring that would silently shift the list off the requested day.
+            anchor = real_earliest
+            if strict_date and preferred_date:
+                try:
+                    from datetime import datetime as _dt
+                    anchor = _dt.strptime(preferred_date, "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    pass
+            used_date = anchor.strftime("%Y-%m-%d")
+            doctors = [d for d in doctors if _to_date(d.get("Nearest_Date")) == anchor]
+
     enrich_doctors_with_prices(doctors)
     return doctors, used_date
 

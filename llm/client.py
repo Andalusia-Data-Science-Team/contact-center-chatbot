@@ -119,14 +119,45 @@ def call_llm(
             return content
 
         content = _clean_json(content)
+
+        # An LLM response that's only `<think>...</think>` (stripped by
+        # _clean_json) or pure whitespace leaves us with an empty string,
+        # which json.loads rejects with the unhelpful "Expecting value: line
+        # 1 column 1 (char 0)" error. Treat that as malformed and retry.
+        if not content:
+            if json_attempt < json_max_attempts - 1:
+                print(f"[call_llm:{label}] empty content on attempt {json_attempt + 1}/{json_max_attempts}, retrying.")
+                continue
+            print(f"[call_llm:{label}] all {json_max_attempts} attempts returned empty content; falling back to safe default.")
+            return _safe_default(label)
+
         try:
             return json.loads(content)
         except json.JSONDecodeError as e:
             if json_attempt < json_max_attempts - 1:
                 print(f"[call_llm:{label}] malformed JSON on attempt {json_attempt + 1}/{json_max_attempts}, retrying. Error: {e}")
                 continue
-            print(f"[call_llm:{label}] all {json_max_attempts} JSON attempts failed. Last content (truncated): {content[:300]}")
-            raise
+            # Final failure: don't crash the booking. Log and return a safe
+            # default so the pipeline's stage-aware safety_net can recover.
+            print(f"[call_llm:{label}] all {json_max_attempts} JSON attempts failed; falling back to safe default. Last content (truncated): {content[:300]}")
+            return _safe_default(label)
+
+
+def _safe_default(label: str) -> dict:
+    """Return a shape-appropriate empty result when JSON parsing fails after
+    all retries. Each call site has different expected keys; returning the
+    right shape lets downstream code use `.get()` without KeyErrors and lets
+    the stage-aware safety_net fill in the actual user-facing reply.
+    """
+    if label == "conversation":
+        return {"reply": "", "state_updates": {}}
+    if label == "routing":
+        return {"specialty": "", "confidence": 0}
+    if label == "triage":
+        return {"question": ""}
+    if label == "intent":
+        return {"intent": "booking", "confidence": 0}
+    return {}
 
 
 def _clean_json(content: str) -> str:

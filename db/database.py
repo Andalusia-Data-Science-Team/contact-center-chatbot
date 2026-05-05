@@ -109,6 +109,7 @@ WITH FreeSlotsRanked AS (
     INNER JOIN OPD.BK_PatternInstance pl ON sl.PatternInstanceID = pl.ID
     INNER JOIN [OPD].PHS_OPDPattern p ON pl.PatternID = p.ID AND pl.PhysicianID = p.PhysicianID
     WHERE ap.SlotID IS NULL
+      AND sl.StartDate = @ReportDate
       AND (sl.StartDate > CAST(GETDATE() AS DATE)
            OR (sl.StartDate = CAST(GETDATE() AS DATE) AND sl.StartTime >= CAST(GETDATE() AS TIME)))
       AND p.IsDeleted = 0

@@ -64,7 +64,7 @@ def format_time(t, lang: str = "en") -> str:
 
 
 def format_date(d, lang: str = "en") -> str:
-    """Format a date. Arabic returns 'اليوم', 'غدا', or 'الإثنين، ١٠ مارس'."""
+    """Format a date. Arabic returns 'اليوم', 'بكره', or 'الإثنين، ١٠ مارس'."""
     if d is None:
         return "N/A"
     if isinstance(d, str):
@@ -78,7 +78,7 @@ def format_date(d, lang: str = "en") -> str:
         if d == today:
             return "اليوم"
         if d == today + timedelta(days=1):
-            return "غدا"
+            return "بكره"
         day_name = _AR_DAYS.get(d.strftime("%A"), d.strftime("%A"))
         month_name = _AR_MONTHS.get(d.strftime("%B"), d.strftime("%B"))
         day_num = _to_arabic_numerals(str(d.day))

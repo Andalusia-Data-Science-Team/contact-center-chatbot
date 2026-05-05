@@ -1,17 +1,29 @@
 # config/constants.py
 # ─── Domain data: specialty lists, emergency keywords ───
 
+# Pediatric specialties — EN names MUST match the live DB's
+# OPD.BK_Appointment.SpecialtyEnName values exactly (verified via
+# scripts/verify_pediatric_specialties.py against the AHJ DB).
+# Note: SQL Server's default collation is case-insensitive and `=` is
+# space-padded, so the bot would still functionally match against the DB
+# even with mismatched casing — but keeping these in sync keeps the
+# strings the bot stores in state and shows to the patient consistent.
 PEDIATRIC_SPECIALTIES_EN = [
-    "General Pediatrics", "Pediatrics", "Pediatric Cardiology",
-    "Pediatric Endocrinology", "Pediatric Neurology", "Pediatric Orthopedics",
-    "Pediatric Surgery", "Pedodontic", "Pediatric Allergy & Immunology",
-    "Pediatric Nephrology", "Pediatric Hematology", "NICU",
+    "General Pediatrics", "Pediatrics", "Pediatric medicine",
+    "Pediatric Cardiology", "Pediatric Endocrinology", "Pediatric Neurology",
+    "Pediatric Orthopedics", "Pediatric surgery", "Pedodontic",
+    "Pediatric Allergy & Immunology", "Pediatric Nephrology",
+    "Pediatric hematology", "Pediatric Gastroenterology",
+    "Pediatric Rheumatology", "NICU",
 ]
 
 PEDIATRIC_SPECIALTIES_AR = [
     "طب الأطفال", "طب الأطفال العام", "القلب والأوعية الدموية للأطفال",
     "أمراض الغدد الصماء للأطفال", "طب أعصاب الأطفال", "جراحة العظام للأطفال",
     "جراحة الأطفال", "طب أسنان الأطفال", "وحدة العناية المركزة لحديثي الولادة",
+    "الحساسية والمناعة للأطفال", "أمراض الكلى للأطفال",
+    "أمراض الدم للأطفال", "أمراض الجهاز الهضمي للأطفال",
+    "أمراض الروماتيزم للأطفال",
 ]
 
 SPECIALTIES_EN = [
@@ -28,7 +40,7 @@ SPECIALTIES_EN = [
     "Neuropsychiatry", "Nutrition", "OBE & GYN", "Oncology", "Ophthalmology",
     "Oral Surgery", "Orthodontic", "Orthopedics", "Otorhinolaryngology",
     "Pediatric Cardiology", "Pediatric Endocrinology", "Pediatric Neurology",
-    "Pediatric Orthopedics", "Pediatric Surgery", "Pediatrics", "Pedodontic",
+    "Pediatric Orthopedics", "Pediatric surgery", "Pediatrics", "Pedodontic",
     "Physiotherapy", "Plastic Surgery", "Procedure Room", "Prosthesis",
     "Psychiatry", "Radiology", "Rheumatology", "Screening", "Spine Surgery",
     "Surgical Oncology", "Urology", "Urology and Andrology", "Vascular Surgery",
@@ -146,13 +158,20 @@ SPECIALTY_EN_TO_AR = {
     "Orthodontic": "تقويم الأسنان",
     "Orthopedics": "جراحة العظام",
     "Otorhinolaryngology": "أنف وأذن وحنجرة",
+    "Pediatric Allergy & Immunology": "الحساسية والمناعة للأطفال",
     "Pediatric Cardiology": "القلب والأوعية الدموية للأطفال",
     "Pediatric Endocrinology": "أمراض الغدد الصماء للأطفال",
+    "Pediatric Gastroenterology": "أمراض الجهاز الهضمي للأطفال",
+    "Pediatric hematology": "أمراض الدم للأطفال",
+    "Pediatric medicine": "طب الأطفال",
+    "Pediatric Nephrology": "أمراض الكلى للأطفال",
     "Pediatric Neurology": "طب أعصاب الأطفال",
     "Pediatric Orthopedics": "جراحة العظام للأطفال",
-    "Pediatric Surgery": "جراحة الأطفال",
+    "Pediatric Rheumatology": "أمراض الروماتيزم للأطفال",
+    "Pediatric surgery": "جراحة الأطفال",
     "Pediatrics": "طب الأطفال",
     "Pedodontic": "طب أسنان الأطفال",
+    "NICU": "وحدة العناية المركزة لحديثي الولادة",
     "Physiotherapy": "العلاج الطبيعي",
     "Plastic Surgery": "جراحة التجميل",
     "Prosthesis": "تركيبات الأسنان",

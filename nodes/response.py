@@ -28,7 +28,7 @@ def response_node(state: BookingState) -> BookingState:
     # Safety net: if mid-booking, never show a canned non-booking response
     if booking_stage and booking_stage not in ("none", None):
         if lang == "ar":
-            state["last_bot_message"] = "عذراً، ممكن توضحلي أكتر؟ أنا أساعدك في إتمام حجزك."
+            state["last_bot_message"] = "عذراً، ممكن توضحلي أكثر؟ أنا أساعدك في إتمام حجزك."
         else:
             state["last_bot_message"] = "Sorry, could you clarify? I'm helping you complete your booking."
         return state

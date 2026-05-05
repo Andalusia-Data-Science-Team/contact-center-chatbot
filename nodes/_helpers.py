@@ -41,10 +41,29 @@ def apply_llm_updates(state: dict, updates: dict) -> None:
         "date", "preferred_time", "patient_name", "phone", "insurance_company",
         "booking_stage",
     ]
+    # Defensive guard: when the patient is at routing/post-routing and replies
+    # with a bare acceptance ("اه", "نعم", "ok"), the LLM occasionally echoes
+    # that token back into complaint_text, which then corrupts re-routing on
+    # the next pass. Keep complaint_text frozen once a specialty has been set.
+    last_user = get_last_user_message(state) or ""
+    last_is_short_accept = (
+        is_acceptance(last_user) and len(last_user.strip().split()) <= 2
+    )
+    specialty_already_set = bool(state.get("speciality") or state.get("speciality_ar"))
+
     for f in STRING_FIELDS:
         v = updates.get(f)
-        if v is not None and v not in ("null", "") and not _is_placeholder_value(v):
-            state[f] = v
+        if v is None or v in ("null", "") or _is_placeholder_value(v):
+            continue
+        if (
+            f == "complaint_text"
+            and specialty_already_set
+            and last_is_short_accept
+        ):
+            # Don't let "اه" / "yes" become the new complaint_text and trigger
+            # re-routing against a meaningless token.
+            continue
+        state[f] = v
 
     # Requested date: resolve relative words ("بكرا", "tomorrow") to YYYY-MM-DD.
     # Never replace an already-resolved ISO date with raw text the LLM couldn't
@@ -154,6 +173,10 @@ ACCEPTANCE_WORDS = {
     "نعم", "اوك", "موافق", "تمام", "زين", "ماشي", "اكيد", "ايوه", "ايه",
     "ابشر", "مناسب", "يناسبني", "كويس", "حلو", "طيب",
     "ان شاء الله", "ان شاءالله",
+    # Short Saudi/Gulf affirmatives — covers "أه"/"اه", "إي"/"أي"/"اي",
+    # and elongated forms ("اها", "ايي"). Kept in WORDS (exact match) only;
+    # substring matching would falsely fire on common words like "اهلا".
+    "اه", "اها", "اهه", "اي", "ايي", "اجل", "اكيييد",
 }
 
 ACCEPTANCE_PARTIAL = {"yes", "ok", "sure", "نعم", "تمام", "زين", "ماشي", "مناسب", "طيب", "ايوه"}

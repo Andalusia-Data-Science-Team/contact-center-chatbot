@@ -16,6 +16,8 @@ Updated flow to match real Andalusia agent behavior:
 - No triage questions
 - Direct routing from complaint to doctor list
 """
+import re
+
 from langgraph.graph import StateGraph, END
 from state import BookingState
 from nodes.language import language_node
@@ -27,6 +29,122 @@ from nodes.routing import routing_node
 from nodes.doctor_selection import doctor_selection_node
 from nodes.slot_selection import slot_selection_node
 from nodes.patient_info import patient_info_node
+
+
+# ── Challenge / contradiction detection ──────────────────────────────────────
+# When the patient pushes back ("you said today!", "ما انتى قلتيلى اليوم متاح")
+# the bot should acknowledge instead of stoically repeating the same answer.
+# Patterns are tight on purpose — generic words like "ليش" alone don't qualify;
+# the patient must reference what we said earlier.
+_CHALLENGE_PATTERNS_AR = [
+    re.compile(r"(ما|بس)\s*ا?نت[يى]?\s*قلت[يى]?(لي|لى|ل[يى])?"),
+    re.compile(r"\bقلت[يى]?\s*ل?[يى]?\s*(اول|قبل|الحين|تو)"),
+    re.compile(r"\bكنت[يى]?\s*قلت[يى]?"),
+    re.compile(r"\bمتناقض|تناقض|عكس\s*كلامك"),
+    re.compile(r"\bلي?ش\s*(متغير|اختلف|تغير)"),
+    re.compile(r"\bكيف\s*كذا\b"),
+]
+_CHALLENGE_PATTERNS_EN = [
+    re.compile(r"\bbut\s+you\s+(said|told)\b", re.IGNORECASE),
+    re.compile(r"\byou\s+(just\s+)?(said|told)\b", re.IGNORECASE),
+    re.compile(r"\bwait[,!\s]+you\s+(said|told)\b", re.IGNORECASE),
+    re.compile(r"\bcontradict", re.IGNORECASE),
+    re.compile(r"\bthat[''s]?\s+not\s+what\s+you\s+(said|told)\b", re.IGNORECASE),
+]
+
+
+def _detect_user_challenge(state: BookingState) -> bool:
+    """True if the latest patient message is pushing back on what we said."""
+    messages = state.get("messages") or []
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if not last_user:
+        return False
+    text = (last_user.get("content") or "").strip()
+    if not text:
+        return False
+    # Try AR patterns on raw text (Arabic regex doesn't need normalization here
+    # since the patterns already accept common spelling variants).
+    for pat in _CHALLENGE_PATTERNS_AR:
+        if pat.search(text):
+            return True
+    for pat in _CHALLENGE_PATTERNS_EN:
+        if pat.search(text):
+            return True
+    return False
+
+
+def _apology_prefix(lang: str) -> str:
+    if lang == "ar":
+        return "آسفة على اللخبطة"
+    return "Apologies for the confusion"
+
+
+# ── Repetition / loop detection ──────────────────────────────────────────────
+# If the bot is about to send the same reply it just sent, the patient is
+# stuck in a loop ("اليوم"/"مين متاح اليوم"/"بس اليوم") and rephrasing won't
+# help — break out with an escalation that offers a callback or change of
+# strategy instead of repeating the same words.
+
+def _normalize_for_repeat(text: str) -> str:
+    """Strip apology prefix and whitespace so we compare the message body."""
+    t = (text or "").strip()
+    for prefix in ("آسفة على اللخبطة", "Apologies for the confusion"):
+        if t.startswith(prefix):
+            # Drop the prefix and the dash separator we add in _safety_net.
+            t = t[len(prefix):].lstrip(" —-").strip()
+    return t
+
+
+def _is_repeating(state: BookingState, new_reply: str) -> bool:
+    """True if `new_reply` matches the most recent assistant message."""
+    body = _normalize_for_repeat(new_reply)
+    if not body:
+        return False
+    messages = state.get("messages") or []
+    recent_assistant = [
+        _normalize_for_repeat(m.get("content"))
+        for m in messages if m.get("role") == "assistant"
+    ]
+    # Compare against the last assistant message only — one repeat is enough
+    # to break the cycle before the patient grows more frustrated.
+    return bool(recent_assistant) and recent_assistant[-1] == body
+
+
+def _escalation_message(state: BookingState, lang: str) -> str:
+    """Reply offering a path forward when we'd otherwise repeat ourselves."""
+    stage = state.get("booking_stage")
+    doctor = state.get("doctor")
+    if lang == "ar":
+        if stage in ("slot_selection", "patient_info") and doctor:
+            return (
+                "آسفة، أحس إني أكرر نفس الكلام. "
+                "تبغى أعرض لك أيام ثانية، أحجز لك مع دكتور ثاني، "
+                "أو نسجل بياناتك ويتواصل معك فريق خدمة العملاء؟"
+            )
+        if stage == "doctor_list":
+            return (
+                "آسفة على اللخبطة. تبغى أعرض لك القائمة من جديد، "
+                "أو نسجل بياناتك ويتواصل معك فريق خدمة العملاء؟"
+            )
+        return (
+            "آسفة، يبدو إني عالقة في نفس النقطة. "
+            "تبغى نسجل بياناتك ويتواصل معك فريق خدمة العملاء عشان نساعدك أحسن؟"
+        )
+    if stage in ("slot_selection", "patient_info") and doctor:
+        return (
+            "Sorry, I notice I'm repeating myself. "
+            "Would you like to try a different day, switch to another doctor, "
+            "or have our team contact you to help?"
+        )
+    if stage == "doctor_list":
+        return (
+            "Apologies — would you like me to show the list again, "
+            "or have our team reach out to help you book?"
+        )
+    return (
+        "Sorry, I seem to be stuck on the same answer. "
+        "Would you like our team to contact you so we can help you better?"
+    )
 
 
 # ── Routing functions ────────────────────────────────────────────────────────
@@ -85,7 +203,7 @@ def _safety_net(state: BookingState) -> BookingState:
             patient = state.get("patient_name", "")
             if lang == "ar":
                 greeting = f"أ/ {patient}" if patient else ""
-                state["last_bot_message"] = f"أهلا وسهلا بحضرتك {greeting}، ازاي أقدر أساعدك؟"
+                state["last_bot_message"] = f"أهلا وسهلا بحضرتك {greeting}، كيف أقدر أساعدك؟"
             else:
                 state["last_bot_message"] = f"Welcome {patient}! How can I help you today?"
         elif stage == "complaint":
@@ -93,8 +211,8 @@ def _safety_net(state: BookingState) -> BookingState:
             if lang == "ar":
                 name_part = f" أ/ {patient}" if patient else ""
                 state["last_bot_message"] = (
-                    f"تمام{name_part} — ممكن تقولي إيه المشكلة اللي محتاج كشف عليها؟ "
-                    f"أو تخصص الدكتور اللي تبغى تحجز معاه؟"
+                    f"تمام{name_part} — ممكن تقولي وش المشكلة اللي محتاج كشف عليها؟ "
+                    f"أو تخصص الدكتور اللي تبغى تحجز معه؟"
                 )
             else:
                 state["last_bot_message"] = (
@@ -127,6 +245,43 @@ def _safety_net(state: BookingState) -> BookingState:
                 state["last_bot_message"] = "ممكن تعيد طلبك بطريقة ثانية؟"
             else:
                 state["last_bot_message"] = "Could you rephrase that?"
+
+    # If the bot is about to send the same reply it just sent, break the loop
+    # with an escalation message instead of repeating ourselves verbatim. Run
+    # this BEFORE the apology prefix is added — otherwise a prefixed-vs-bare
+    # version of the same message would slip through as "different".
+    lang = state.get("language", "en")
+    current_reply = state.get("last_bot_message") or ""
+    if _is_repeating(state, current_reply):
+        state["last_bot_message"] = _escalation_message(state, lang)
+        # Stop further booking advancement on this stale path.
+        if state.get("booking_stage") not in ("complete", "cancelled"):
+            state["booking_stage"] = "callback_pending"
+
+    # If the patient pushed back on something we said, acknowledge it before
+    # delivering the reply. Avoids the loop where the bot repeats the same
+    # answer in the face of "ما انتى قلتيلى اليوم متاح!".
+    if _detect_user_challenge(state):
+        reply = state.get("last_bot_message") or ""
+        prefix = _apology_prefix(lang)
+        # Only prepend once — don't stack apologies if the reply already
+        # starts with one.
+        if reply and not reply.lstrip().startswith(prefix):
+            state["last_bot_message"] = f"{prefix} — {reply}"
+
+    # Last-mile dialect sanitization. The conversation prompt forbids Egyptian
+    # / Levantine markers in Saudi-language replies, but the LLM occasionally
+    # drifts ("ازاي" / "عايز" / "هكلمك"). Replace before delivery so the
+    # patient never sees off-dialect copy regardless of LLM compliance.
+    from utils.language import sanitize_dialect
+    if state.get("last_bot_message"):
+        state["last_bot_message"] = sanitize_dialect(
+            state["last_bot_message"], lang,
+        )
+    if state.get("followup_message"):
+        state["followup_message"] = sanitize_dialect(
+            state["followup_message"], lang,
+        )
 
     # Clean up transient data (but NOT followup_message — app.py reads it after)
     state["_llm_updates"] = None

@@ -18,11 +18,11 @@ def _spec_display(specialty_en: str, lang: str) -> str:
 def _ar_day(date_label: str) -> str:
     """Return a natural Arabic day phrase.
 
-    "اليوم" / "غدا" stand on their own — prefixing "يوم اليوم" or "يوم غدا"
+    "اليوم" / "بكره" stand on their own — prefixing "يوم اليوم" or "يوم بكره"
     reads as redundant. For other forms (e.g. "الخميس، ٣٠ أبريل") "يوم X" is
     the natural form.
     """
-    if date_label in ("اليوم", "غدا"):
+    if date_label in ("اليوم", "بكره", "غدا"):
         return date_label
     return f"يوم {date_label}"
 
@@ -30,11 +30,11 @@ def _ar_day(date_label: str) -> str:
 def _ar_day_for(date_label: str) -> str:
     """Return a natural Arabic phrase for "for / on {day}" usage.
 
-    Maps "اليوم" → "اليوم" and "غدا" → "غدا" (no preposition needed) and
+    Maps "اليوم" → "اليوم" and "بكره" → "بكره" (no preposition needed) and
     other days to "ليوم X". Used in the doctor list message
     ("doctors available for {day}").
     """
-    if date_label in ("اليوم", "غدا"):
+    if date_label in ("اليوم", "بكره", "غدا"):
         return date_label
     return f"ليوم {date_label}"
 
@@ -84,19 +84,54 @@ def doctor_list_message(doctors: list, specialty: str, lang: str, date_used: str
         lines.append(entry)
 
     body = "\n".join(lines)
+    single = len(doctors) == 1
     if lang == "ar":
         day_phrase = _ar_day_for(date_label)
+        if single:
+            cta = "تبغي أعرض لك المواعيد المتاحة ولا أقرب موعد يناسبك؟"
+        else:
+            cta = "تبغى تحجز مع مين؟"
         return (
             f"تخصص **{spec_name}** — الأطباء المتاحين {day_phrase}:\n\n{body}\n\n"
-            f"تحب تحجز مع مين؟"
+            f"{cta}"
         )
     if date_label in ("Today", "Tomorrow"):
         en_date_part = date_label.lower()
     else:
         en_date_part = f"on {date_label}"
+    if single:
+        cta = "Would you like me to show you all available slots, or does the earliest one work for you?"
+    else:
+        cta = "Which doctor would you prefer?"
     return (
         f"For **{spec_name}** — available doctors {en_date_part}:\n\n{body}\n\n"
-        f"Which doctor would you prefer?"
+        f"{cta}"
+    )
+
+
+def no_doctors_on_date_message(specialty: str, requested_date, lang: str) -> str:
+    """Patient explicitly asked for a date and the specialty has no doctors
+    that day. Don't promise a callback (the specialty exists, just not on that
+    day) — invite the patient to pick a different date."""
+    spec_name = _spec_display(specialty, lang)
+    date_label = format_date(requested_date, lang) if requested_date else ""
+    if lang == "ar":
+        day_phrase = _ar_day(date_label) if date_label else ""
+        suffix = f" {day_phrase}" if day_phrase else ""
+        return (
+            f"للأسف ما في أطباء **{spec_name}** متاحين{suffix}. "
+            f"تبغى تجرب يوم ثاني؟"
+        )
+    if date_label in ("Today", "Tomorrow"):
+        when = date_label.lower()
+    elif date_label:
+        when = f"on {date_label}"
+    else:
+        when = ""
+    suffix = f" {when}" if when else ""
+    return (
+        f"Unfortunately no **{spec_name}** doctors are available{suffix}. "
+        f"Would you like to try another date?"
     )
 
 
@@ -159,6 +194,60 @@ def more_slots_message(doctor_en: str, doctor_ar: str, all_slots: list, lang: st
     return f"Available slots for {prefix}{doc}{date_part}{period}:\n\n{body}\n\nWhich works for you?"
 
 
+def slot_with_alternatives_message(
+    doctor_en: str,
+    doctor_ar: str,
+    slot_info: dict,
+    alternatives: list,
+    requested_date,
+    lang: str,
+) -> str:
+    """Selected doctor has no slots on `requested_date` — surface the next
+    available slot with them PLUS other doctors who DO have same-day openings,
+    so the patient can stay on their preferred day with a different doctor."""
+    doc = (doctor_ar or doctor_en) if lang == "ar" else doctor_en
+    prefix = "د. " if lang == "ar" else "Dr. "
+    requested_label = format_date(requested_date, lang)
+    fallback_date_label = format_date(slot_info["first_date"], lang)
+    fallback_time = format_time(slot_info["first_time"], lang)
+
+    alt_lines = []
+    for alt in alternatives:
+        alt_name = (alt.get("DoctorAR") or alt.get("Doctor", "?")) if lang == "ar" \
+                   else alt.get("Doctor", "?")
+        alt_time = _time_display(alt.get("Nearest_Time"), lang)
+        if lang == "ar":
+            alt_lines.append(f"• **{prefix}{alt_name}** — أقرب موعد {alt_time}")
+        else:
+            alt_lines.append(f"• **{prefix}{alt_name}** — earliest at {alt_time}")
+    alt_body = "\n".join(alt_lines)
+
+    if lang == "ar":
+        req_phrase = _ar_day(requested_label)
+        fall_phrase = _ar_day(fallback_date_label)
+        return (
+            f"للأسف {prefix}{doc} ما عنده مواعيد {req_phrase}. "
+            f"أقرب موعد معه {fall_phrase} الساعة **{fallback_time}**.\n\n"
+            f"بس في أطباء آخرين متاحين {req_phrase}:\n{alt_body}\n\n"
+            f"تحب تكمل مع {prefix}{doc} {fall_phrase}، ولا تختار دكتور ثاني {req_phrase}؟"
+        )
+
+    if requested_label in ("Today", "Tomorrow"):
+        req_phrase = requested_label.lower()
+    else:
+        req_phrase = f"on {requested_label}"
+    if fallback_date_label in ("Today", "Tomorrow"):
+        fall_phrase = fallback_date_label.lower()
+    else:
+        fall_phrase = f"on {fallback_date_label}"
+    return (
+        f"Unfortunately {prefix}{doc} has no slots {req_phrase}. "
+        f"The earliest with them is {fall_phrase} at **{fallback_time}**.\n\n"
+        f"Other doctors are available {req_phrase}:\n{alt_body}\n\n"
+        f"Would you like to keep {prefix}{doc} {fall_phrase}, or pick another doctor {req_phrase}?"
+    )
+
+
 def slot_confirmed_message(doctor_en: str, doctor_ar: str,
                            slot_date: str, slot_time: str,
                            lang: str, is_fallback: bool = False) -> str:
@@ -191,6 +280,51 @@ def no_slots_message(doctor_en: str, doctor_ar: str, lang: str) -> str:
     if lang == "ar":
         return f"للأسف {prefix}{doc} ما عنده مواعيد متاحة حالياً. تبغى تختار دكتور ثاني؟"
     return f"Unfortunately {prefix}{doc} has no available slots right now. Would you like to choose another doctor?"
+
+
+def no_slots_with_alternatives_message(
+    doctor_en: str,
+    doctor_ar: str,
+    others: list,
+    lang: str,
+) -> str:
+    """Selected doctor has no slots in the search window. Surface other doctors
+    in the same specialty (with the date/time of their earliest availability)
+    so the patient has a concrete next step instead of just "try another date".
+    """
+    doc = (doctor_ar or doctor_en) if lang == "ar" else doctor_en
+    prefix = "د. " if lang == "ar" else "Dr. "
+
+    alt_lines = []
+    for alt in others:
+        alt_name = (alt.get("DoctorAR") or alt.get("Doctor", "?")) if lang == "ar" \
+                   else alt.get("Doctor", "?")
+        alt_time = _time_display(alt.get("Nearest_Time"), lang)
+        alt_date_label = format_date(alt.get("Nearest_Date"), lang) if alt.get("Nearest_Date") else ""
+        if lang == "ar":
+            date_part = f" {_ar_day(alt_date_label)}" if alt_date_label else ""
+            alt_lines.append(f"• **{prefix}{alt_name}** — أقرب موعد{date_part} الساعة {alt_time}")
+        else:
+            if alt_date_label in ("Today", "Tomorrow"):
+                date_part = f" {alt_date_label.lower()}"
+            elif alt_date_label:
+                date_part = f" on {alt_date_label}"
+            else:
+                date_part = ""
+            alt_lines.append(f"• **{prefix}{alt_name}** — earliest{date_part} at {alt_time}")
+    body = "\n".join(alt_lines)
+
+    if lang == "ar":
+        return (
+            f"للأسف {prefix}{doc} ما عنده مواعيد متاحة حالياً. "
+            f"بس في أطباء آخرين في نفس التخصص:\n{body}\n\n"
+            f"تحب تحجز مع أحدهم، ولا نجرب يوم ثاني؟"
+        )
+    return (
+        f"Unfortunately {prefix}{doc} has no available slots right now. "
+        f"Other doctors in the same specialty:\n{body}\n\n"
+        f"Would you like to book with one of them, or try another date?"
+    )
 
 
 def doctor_confirm_message(matched_name: str, lang: str) -> str:
@@ -301,7 +435,7 @@ def price_unknown_insurance_message(doctor_en: str, doctor_ar: str, amount, lang
     # No price on file — still ask cash/insurance so we know the billing path
     if lang == "ar":
         return (
-            "السعر بيختلف حسب طريقة الدفع. هل الدفع كاش أم عندك تأمين؟ "
+            "السعر يختلف حسب طريقة الدفع. هل الدفع كاش أم عندك تأمين؟ "
             "لو تأمين، التأمين يغطي الكشف."
         )
     return (
@@ -315,8 +449,8 @@ def price_no_data_message(doctor_en: str, doctor_ar: str, lang: str) -> str:
     prefix = "د. " if lang == "ar" else "Dr. "
     if lang == "ar":
         return (
-            f"سعر الكشف كاش لـ {prefix}{doc} مش متاح عندي حالياً، "
-            f"بس هنتواصل معاك ونبلغك بالسعر في أقرب وقت."
+            f"سعر الكشف كاش لـ {prefix}{doc} مو متاح عندي حالياً، "
+            f"بس راح نتواصل معك ونبلغك بالسعر في أقرب وقت."
         )
     return (
         f"I don't have the cash price for {prefix}{doc} on file right now — "
@@ -327,8 +461,8 @@ def price_no_data_message(doctor_en: str, doctor_ar: str, lang: str) -> str:
 def price_no_doctor_message(lang: str) -> str:
     if lang == "ar":
         return (
-            "السعر بيختلف من دكتور للتاني. لو تحب، اختار الدكتور من القائمة "
-            "وأقدر أطلعلك السعر بالظبط."
+            "السعر يختلف من دكتور لثاني. لو تبغى، اختر الدكتور من القائمة "
+            "وأقدر أعرض لك السعر بالضبط."
         )
     return (
         "Prices vary by doctor. Pick a doctor from the list and I can share the "
@@ -395,7 +529,7 @@ def app_download_message(lang: str) -> str:
     """Separate follow-up message about the Dotcare app — sent after confirmation."""
     if lang == "ar":
         return (
-            "توفيراً لوقتك، تقدر تحجز أي كشفية أو متابعة بشكل مباشر من خلال تطبيق **Dotcare for Health and Lifestyle** 📱\n\n"
+            "توفيراً لوقتك، تقدر تحجز أي كشف أو متابعة بشكل مباشر عن طريق تطبيق **Dotcare for Health and Lifestyle** 📱\n\n"
             "حمّله من هنا:\n"
             "• Google Play: https://play.google.com/store/apps/details?id=net.andalusiagroup.andalusiabooking\n"
             "• App Store: https://apps.apple.com/eg/app/dotcare-for-health-lifestyle/id972029385"

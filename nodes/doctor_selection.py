@@ -35,12 +35,41 @@ def doctor_selection_node(state: BookingState) -> BookingState:
     if state.get("booking_stage") in ("cancelled", "callback_pending"):
         return state
 
+    # Single-doctor branch: only one doctor was listed and we asked the patient
+    # to pick "all slots" vs "earliest". The doctor is already auto-selected;
+    # the user's reply just decides which slot view to show.
+    if state.get("_single_doctor_choice_pending"):
+        state["_single_doctor_choice_pending"] = False
+        last_msg = (get_last_user_message(state) or "").strip()
+        if _wants_all_slots(last_msg):
+            state["last_bot_message"] = _show_all_slots_for_doctor(state, lang)
+        else:
+            state["last_bot_message"] = _handle_slot_fetch(state, lang)
+        # Block slot_selection from re-interpreting "أقرب" / "show all" / "نعم"
+        # as a time preference and overwriting the reply.
+        state["_skip_time_preference_this_turn"] = True
+        return state
+
     # Case 1: Patient typed a doctor name — fuzzy match it.
     # Safety net first: when patients say "دكتور اسنان" / "doctor cardio", the
     # LLM often captures the specialty word as a doctor name. Strip the title
     # prefix and check against the specialty keyword list before treating it
     # as a name — otherwise we ask "do you mean Dr. اسنان?" which is nonsense.
-    if updates.get("doctor_fuzzy_input") and not state.get("doctor"):
+    #
+    # Allow a doctor switch when same-day alternatives were just offered: the
+    # patient has effectively been told "pick another doctor for today", so a
+    # named doctor in the next reply is a switch, not a duplicate selection.
+    allow_switch = bool(state.get("_alternatives_offered"))
+    if updates.get("doctor_fuzzy_input") and (not state.get("doctor") or allow_switch):
+        if allow_switch:
+            # Reset selection state so the existing match flow re-runs cleanly
+            # against `available_doctors` for the new pick.
+            state["doctor"] = None
+            state["doctor_ar"] = None
+            state["selected_slot"] = None
+            state["_proposed_slot"] = None
+            state["available_slots"] = []
+            state["_alternatives_offered"] = False
         raw_doctor = (updates["doctor_fuzzy_input"] or "").strip()
         stripped = raw_doctor
         for prefix in ("د. ", "د.", "د ", "دكتور ", "الدكتور ", "Dr. ", "Dr.", "Dr "):
@@ -100,17 +129,25 @@ def doctor_selection_node(state: BookingState) -> BookingState:
 
         if new_date and _ISO_DATE_RE.match(new_date) and new_date != state.get("date"):
             from services.doctor_selector import fetch_doctors
-            from services.formatter import doctor_list_message, no_doctors_message
+            from services.formatter import (
+                doctor_list_message, no_doctors_on_date_message,
+            )
             specialty = state.get("speciality") or state.get("speciality_ar") or ""
-            doctors, used_date = fetch_doctors(specialty, lang, new_date)
+            # Patient just asked for a specific date — restrict to that day so
+            # the new list either matches their ask or we tell them clearly
+            # nothing is available for it, instead of silently rolling forward.
+            doctors, used_date = fetch_doctors(specialty, lang, new_date, strict_date=True)
             state["date"] = used_date
             state["available_doctors"] = doctors
             if doctors:
                 state["last_bot_message"] = doctor_list_message(
                     doctors, specialty, lang, used_date,
                 )
+                auto_select_if_single_doctor(state, doctors)
             else:
-                state["last_bot_message"] = no_doctors_message(specialty, lang)
+                state["last_bot_message"] = no_doctors_on_date_message(
+                    specialty, new_date, lang,
+                )
             return state
 
     return state
@@ -142,7 +179,7 @@ def _redirect_to_specialty(specialty_word: str, state: dict, lang: str) -> str:
     if not specialty:
         # Fallback: ask the patient to clarify rather than treating as a name.
         if lang == "ar":
-            return "ممكن توضحلي أكتر إيش التخصص اللي تبغاه؟"
+            return "ممكن توضحلي أكثر وش التخصص اللي تبغاه؟"
         return "Could you tell me a bit more about which specialty you need?"
 
     state["speciality"] = specialty
@@ -353,6 +390,17 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
     state["available_slots"] = slots
 
     if not slots:
+        # Before falling back to "try another date", surface any other doctors
+        # in the same specialty that we already loaded — gives the patient a
+        # concrete alternative instead of a dead-end.
+        others = _other_doctors_with_availability(state)
+        if others:
+            from services.formatter import no_slots_with_alternatives_message
+            state["_alternatives_offered"] = True
+            return no_slots_with_alternatives_message(
+                state.get("doctor", ""), state.get("doctor_ar", ""),
+                others, lang,
+            )
         date_label = format_date(used_date, lang)
         if lang == "ar":
             return f"للأسف ما في مواعيد متاحة في {date_label}. تبغى أجرب يوم ثاني؟"
@@ -373,10 +421,138 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
         "date": slot_info["first_date"].strftime("%Y-%m-%d"),
         "date_display": format_date(slot_info["first_date"], lang),
     }
+
+    # When the slot fetch silently shifted to a later day, look for OTHER
+    # doctors in the same specialty who DO have slots on the requested date.
+    # Surfacing those alternatives lets the patient stay on their preferred
+    # day with a different doctor instead of being limited to the next-day
+    # fallback for the doctor they originally picked. Use date_to_use (the
+    # date we asked for — either patient-requested or the date the list was
+    # shown for) so this fires even when the patient never explicitly typed
+    # a date but the selected doctor's slots silently slipped to a later day.
+    state["_alternatives_offered"] = False
+    target_for_alternatives = date_to_use
+    if (
+        target_for_alternatives
+        and used_date
+        and target_for_alternatives != used_date
+    ):
+        alternatives = _find_same_day_alternatives(
+            state,
+            target_date=target_for_alternatives,
+            exclude_doctor=state.get("doctor", ""),
+        )
+        if alternatives:
+            from services.formatter import slot_with_alternatives_message
+            state["_alternatives_offered"] = True
+            # Make the alternatives addressable by name on the next turn — the
+            # match_doctor flow only looks at available_doctors, so without this
+            # a patient who says "Dr. Y" couldn't switch to an alternative that
+            # came from the slow-path DB query.
+            existing = state.get("available_doctors") or []
+            existing_keys = {
+                (d.get("Doctor", "") or "").strip().lower() for d in existing
+            }
+            for alt in alternatives:
+                key = (alt.get("Doctor", "") or "").strip().lower()
+                if key and key not in existing_keys:
+                    existing.append(alt)
+                    existing_keys.add(key)
+            state["available_doctors"] = existing
+            return slot_with_alternatives_message(
+                state["doctor"], state.get("doctor_ar", ""),
+                slot_info, alternatives, target_for_alternatives, lang,
+            )
+
     fallback_prefix = _fallback_notice(explicit_requested, used_date, lang)
     return fallback_prefix + slot_question(
         state["doctor"], state.get("doctor_ar", ""), slot_info, lang,
     )
+
+
+def _other_doctors_with_availability(state: dict) -> list:
+    """Return up to 3 doctors from `available_doctors` (other than the
+    currently selected one) that have a known earliest slot. Used as a
+    no-dead-end fallback when the selected doctor returns zero slots.
+    """
+    selected = (state.get("doctor", "") or "").strip().lower()
+    available = state.get("available_doctors") or []
+    return [
+        d for d in available
+        if (d.get("Doctor", "") or "").strip().lower() != selected
+        and d.get("Nearest_Time")
+    ][:3]
+
+
+def _find_same_day_alternatives(
+    state: dict, target_date: str, exclude_doctor: str = "",
+) -> list:
+    """Return up to 3 OTHER doctors in the same specialty with slots on
+    `target_date`. Prefers the already-loaded `available_doctors` list when
+    its dates match; otherwise queries the DB fresh for the specialty + date.
+    """
+    if not target_date:
+        return []
+
+    excl = (exclude_doctor or "").strip().lower()
+
+    def _doc_date_iso(doc: dict) -> str:
+        nd = doc.get("Nearest_Date")
+        if hasattr(nd, "strftime"):
+            try:
+                return nd.date().strftime("%Y-%m-%d") if hasattr(nd, "hour") else nd.strftime("%Y-%m-%d")
+            except (AttributeError, ValueError):
+                return ""
+        if isinstance(nd, str) and len(nd) >= 10:
+            return nd[:10]
+        return ""
+
+    target_iso = (
+        target_date if isinstance(target_date, str)
+        else target_date.strftime("%Y-%m-%d")
+    )
+
+    # Fast path: reuse the already-loaded doctor list when its earliest dates
+    # match the target. fetch_doctors filters to a single earliest date, so if
+    # the list is for the requested day we get same-day candidates for free.
+    available = state.get("available_doctors") or []
+    matched = [
+        d for d in available
+        if _doc_date_iso(d) == target_iso
+        and d.get("Nearest_Time")
+        and (d.get("Doctor", "") or "").strip().lower() != excl
+    ]
+    if matched:
+        return matched[:3]
+
+    # Slow path: query the DB for the specialty constrained to target_date.
+    specialty = state.get("speciality") or state.get("speciality_ar") or ""
+    if not specialty:
+        return []
+
+    try:
+        from db.database import query_availability, aggregate_doctor_slots
+        from services.doctor_price import enrich_doctors_with_prices
+
+        rows = query_availability(report_date=target_iso, specialty_en=specialty)
+        if not rows:
+            rows = query_availability(report_date=target_iso, specialty_ar=specialty)
+        if not rows:
+            return []
+
+        doctors = aggregate_doctor_slots(rows)
+        doctors = [
+            d for d in doctors
+            if d.get("Nearest_Time")
+            and _doc_date_iso(d) == target_iso
+            and (d.get("Doctor", "") or "").strip().lower() != excl
+        ]
+        if not doctors:
+            return []
+        enrich_doctors_with_prices(doctors)
+        return doctors[:3]
+    except Exception:
+        return []
 
 
 def _fallback_notice(requested: str, used_date: str, lang: str) -> str:
@@ -443,3 +619,108 @@ def _extract_slots_from_availability(state: dict) -> list:
             return slots
 
     return []
+
+
+# ── Single-doctor auto-selection + response handling ─────────────────────────
+
+def auto_select_if_single_doctor(state: dict, doctors: list) -> bool:
+    """When only one doctor is in the list, auto-select them and mark the
+    state so the next turn handles the "all slots vs earliest" choice instead
+    of treating the user's reply as a doctor pick.
+
+    Returns True if auto-selection happened (caller may want to use a different
+    follow-up flow), False otherwise.
+    """
+    if len(doctors) != 1:
+        return False
+    only = doctors[0]
+    state["doctor"] = only.get("Doctor", "") or ""
+    state["doctor_ar"] = only.get("DoctorAR", "") or ""
+    if only.get("WalkInPrice") is not None:
+        state["walk_in_price"] = only.get("WalkInPrice")
+    state["_single_doctor_choice_pending"] = True
+    return True
+
+
+# Keywords that indicate the patient wants to see ALL available slots
+# (vs. accepting the earliest). Normalized form (after normalize_ar).
+_SHOW_ALL_KEYWORDS = (
+    "كل", "جميع", "متاحه", "متاح", "المواعيد", "مواعيد",
+    "اعرض", "اعرضي", "اعرضها", "ورني", "وريني", "قائمه", "قائمة",
+    "all", "available", "show", "list", "see them", "see all", "options",
+)
+
+# Keywords that indicate the patient wants the EARLIEST slot — these win
+# even if "available"-type words are also present (e.g. "أقرب موعد متاح").
+_EARLIEST_KEYWORDS = (
+    "اقرب", "اول", "earliest", "first", "soonest", "nearest",
+)
+
+
+def _wants_all_slots(text: str) -> bool:
+    """Detect 'show me all available slots' intent for the single-doctor case."""
+    if not text:
+        return False
+    t = normalize_ar(text).lower()
+    if any(w in t for w in _EARLIEST_KEYWORDS):
+        return False
+    return any(kw in t for kw in _SHOW_ALL_KEYWORDS)
+
+
+def _show_all_slots_for_doctor(state: dict, lang: str) -> str:
+    """Fetch slots for the (already-selected) doctor and render the full list.
+
+    Mirrors `_handle_slot_fetch`'s setup so the next turn can confirm any
+    chosen slot via the existing slot_selection flow, but returns the
+    `more_slots_message` view instead of the single-slot proposal.
+    """
+    from services.slot_handler import get_all_slots
+    from services.formatter import more_slots_message
+
+    explicit_requested = state.get("requested_date")
+    date_to_use = explicit_requested or state.get("date")
+    slots, used_date = fetch_slots(
+        state["doctor"], state.get("doctor_ar"), date_to_use,
+    )
+
+    if not slots:
+        slots = _extract_slots_from_availability(state)
+        if slots:
+            used_date = date_to_use or state.get("date", "")
+
+    state["date"] = used_date
+    state["available_slots"] = slots
+
+    if not slots:
+        # No slots → fall back to the same dead-end-avoidance _handle_slot_fetch
+        # uses (alternative doctors, "try another day").
+        others = _other_doctors_with_availability(state)
+        if others:
+            from services.formatter import no_slots_with_alternatives_message
+            state["_alternatives_offered"] = True
+            return no_slots_with_alternatives_message(
+                state.get("doctor", ""), state.get("doctor_ar", ""),
+                others, lang,
+            )
+        date_label = format_date(used_date, lang)
+        if lang == "ar":
+            return f"للأسف ما في مواعيد متاحة في {date_label}. تبغى أجرب يوم ثاني؟"
+        return f"No slots available on {date_label}. Would you like to try another date?"
+
+    state["booking_stage"] = "slot_selection"
+    # Mark the earliest slot as a proposal so a later "تمام" / "yes" can confirm
+    # it cleanly through the existing acceptance flow.
+    slot_info = get_initial_slots(slots)
+    first_time = slot_info["first_time"]
+    state["_proposed_slot"] = {
+        "time_24": first_time.strftime("%H:%M"),
+        "time_display": format_time(first_time, lang),
+        "date": slot_info["first_date"].strftime("%Y-%m-%d"),
+        "date_display": format_date(slot_info["first_date"], lang),
+    }
+    state["_proposal_shown_this_turn"] = True
+
+    all_slots = get_all_slots(slots)
+    return more_slots_message(
+        state["doctor"], state.get("doctor_ar", ""), all_slots, lang,
+    )

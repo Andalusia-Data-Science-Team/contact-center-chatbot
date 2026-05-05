@@ -26,11 +26,36 @@ from nodes._helpers import get_last_user_message, is_acceptance
 from llm.client import call_llm
 from services.router import route_specialty
 from services.doctor_selector import fetch_doctors
-from services.formatter import doctor_list_message, no_doctors_message
+from services.formatter import (
+    doctor_list_message, no_doctors_message, no_doctors_on_date_message,
+)
 from prompts.triage import TRIAGE_PROMPT_EN, TRIAGE_PROMPT_AR
 from utils.datetime_fmt import format_date, resolve_relative_date
 from utils.language import normalize_ar
 from config.constants import SPECIALTY_EN_TO_AR
+
+
+# Adult specialty to fall back to when a pediatric routing returns zero
+# doctors. Names on the right MUST match the hospital DB's SpecialtyEnName
+# column. If a pediatric specialty in `config/constants.py` doesn't actually
+# exist in the DB (verify via `scripts/verify_pediatric_specialties.py`), this
+# table prevents the patient from hitting a dead-end — they still get matched
+# with an adult doctor in the closest body system.
+_ADULT_FALLBACK_FOR_PED = {
+    "Pediatric Cardiology":           "Cardiology",
+    "Pediatric Endocrinology":        "Endocrinology",
+    "Pediatric Gastroenterology":     "Gastroenterology",
+    "Pediatric hematology":           "Hematology",            # DB casing
+    "Pediatric Nephrology":           "Nephrology",
+    "Pediatric Neurology":            "Neurology",
+    "Pediatric Orthopedics":          "Orthopedics",
+    "Pediatric Rheumatology":         "Rheumatology",
+    "Pediatric surgery":              "General Surgery",       # DB casing
+    "Pediatric Allergy & Immunology": "Allergy & Immunology",
+    "Pediatric medicine":             "Internal Medicine",
+    "Pedodontic":                     "Dental Services",
+    "NICU":                           "General Pediatrics",
+}
 
 
 # Tokens that signal the patient is moving forward (giving a date/time) while
@@ -135,7 +160,7 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
     specialty = result["specialty"]
     if not specialty:
         if lang == "ar":
-            state["last_bot_message"] = "ممكن توضحلي أكتر وش المشكلة بالضبط عشان أقدر أساعدك؟"
+            state["last_bot_message"] = "ممكن توضحلي أكثر وش المشكلة بالضبط عشان أقدر أساعدك؟"
         else:
             state["last_bot_message"] = "Could you describe the issue in a bit more detail so I can match you with the right doctor?"
         return state
@@ -188,7 +213,7 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
             patient = state.get("patient_name", "")
             if lang == "ar":
                 name_part = f" أ/ {patient}" if patient else ""
-                state["last_bot_message"] = f"عذراً{name_part}، ما لقينا أطباء متاحين حالياً. ممكن توضحلي أكتر وش تحتاج؟"
+                state["last_bot_message"] = f"عذراً{name_part}، ما لقينا أطباء متاحين حالياً. ممكن توضحلي أكثر وش تحتاج؟"
             else:
                 state["last_bot_message"] = f"Sorry {patient}, no doctors are currently available for that specialty. Could you describe what you need so I can try a different match?"
         return state
@@ -219,19 +244,61 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
         # Honour requested_date if the patient said "بكرا" / "يوم الخميس" before
         # confirming the specialty. Falls back to today's context otherwise.
         preferred = state.get("requested_date") or state.get("date")
-        doctors, used_date = fetch_doctors(specialty, lang, preferred)
+        # When the patient explicitly asked for a date, constrain the search
+        # to that exact day — otherwise a "no eye doctors today" situation
+        # silently shifts to "eye doctors tomorrow" and the patient feels
+        # ignored. Without an explicit date, keep the forward-search fallback.
+        strict = bool(state.get("requested_date"))
+        doctors, used_date = fetch_doctors(specialty, lang, preferred, strict_date=strict)
+
+        # Defensive fallback for pediatric subspecialties whose name in the
+        # bot's constants may not exactly match the hospital DB's
+        # SpecialtyEnName column. If a pediatric routing finds zero doctors
+        # AND we have no rows at all (not just none on the requested day),
+        # retry with the adult counterpart so the patient still gets matched
+        # with a real doctor instead of "no one is available".
+        # Only applies in non-strict mode — in strict-date mode the empty
+        # result is genuine "no doctors on that day".
+        if not doctors and not strict:
+            adult = _ADULT_FALLBACK_FOR_PED.get(specialty)
+            if adult:
+                doctors, used_date = fetch_doctors(adult, lang, preferred, strict_date=False)
+                if doctors:
+                    specialty = adult
+                    state["speciality"] = adult
+
         state["date"] = used_date
         state["available_doctors"] = doctors
 
         if doctors:
             state["booking_stage"] = "doctor_list"
             state["last_bot_message"] = doctor_list_message(doctors, specialty, lang, used_date)
+            from nodes.doctor_selection import auto_select_if_single_doctor
+            auto_select_if_single_doctor(state, doctors)
+        elif strict:
+            # Specialty exists but has nothing on the requested day. Stay in
+            # routing so the patient can pick a different date — don't drop
+            # to callback_pending (the specialty itself isn't unavailable).
+            # Clear requested_date so a follow-up "yes/ok" doesn't immediately
+            # re-query the same dead day; the patient will give a new date or
+            # let the forward-search fallback pick the next available one.
+            state["specialty_confirmed"] = False
+            state["requested_date"] = None
+            state["last_bot_message"] = no_doctors_on_date_message(
+                specialty, preferred, lang,
+            )
         else:
-            # No doctors available — reset specialty so patient can try again
+            # No doctors available in next 7 days — promise a callback and
+            # mark callback_pending so the conversation doesn't loop on
+            # routing → no_doctors → re-routing → no_doctors. conversation_node
+            # respects callback_pending and replies gracefully on subsequent
+            # turns; routing_node early-returns from this stage.
             state["speciality"] = None
             state["speciality_ar"] = None
             state["specialty_confirmed"] = False
-            state["booking_stage"] = "complaint"
+            state["complaint_text"] = None
+            state["routing_clarification"] = None
+            state["booking_stage"] = "callback_pending"
             state["last_bot_message"] = no_doctors_message(specialty, lang)
     else:
         # Patient didn't confirm — maybe they want a different specialty
@@ -269,7 +336,7 @@ def _handle_specialty_confirmation(state: BookingState, lang: str) -> BookingSta
                 )
         else:
             if lang == "ar":
-                state["last_bot_message"] = "ممكن توضحلي أكتر وش تحتاج بالضبط؟"
+                state["last_bot_message"] = "ممكن توضحلي أكثر وش تحتاج بالضبط؟"
             else:
                 state["last_bot_message"] = "Could you tell me a bit more about what you need?"
 

@@ -523,33 +523,83 @@ def _keyword_prefilter(text: str, lang: str, age: int) -> list:
                     for i, s in enumerate(_SYMPTOM_MAP_AR_NORMALIZED[matched_key]):
                         hits[s] += (len(_SYMPTOM_MAP_AR_NORMALIZED[matched_key]) - i)
 
+    explicit_pediatric = _mentions_pediatric(text)
+
+    # Bare "اطفال" / "pediatric" with no body-system match → general pediatrics.
+    # Without this, the prefilter returns nothing and the LLM stage falls back
+    # to the full 75-specialty list, losing the pediatric signal.
     if not hits:
+        if explicit_pediatric:
+            return ["General Pediatrics"]
         return []
 
     # Sort by frequency and take top candidates
     candidates = [s for s, _ in hits.most_common(6)]
 
-    # Add pediatric variants if patient is a child
-    if age and age < PEDIATRIC_AGE_THRESHOLD:
+    # Add pediatric variants when EITHER:
+    #   (a) the patient is a child (age < threshold), OR
+    #   (b) the message itself mentions pediatric keywords ("اطفال", "pediatric",
+    #       "child"). The patient saying "ابغى اطفال غدد" must surface
+    #       Pediatric Endocrinology even when no age is captured.
+    if (age and age < PEDIATRIC_AGE_THRESHOLD) or explicit_pediatric:
+        # Adult specialty → pediatric counterpart (RHS values must match the
+        # live DB's SpecialtyEnName exactly — verified Nov 2026 via
+        # scripts/verify_pediatric_specialties.py).
         ped_map = {
-            "Orthopedics": "Pediatric Orthopedics",
-            "Cardiology": "Pediatric Cardiology",
-            "Neurology": "Pediatric Neurology",
-            "General Pediatrics": "General Pediatrics",
-            "Internal Medicine": "General Pediatrics",
-            "Family Medicine": "General Pediatrics",
-            "Dental Services": "Pedodontic",
+            "Orthopedics":           "Pediatric Orthopedics",
+            "Cardiology":            "Pediatric Cardiology",
+            "Neurology":             "Pediatric Neurology",
+            "Endocrinology":         "Pediatric Endocrinology",
+            "Hematology":            "Pediatric hematology",          # DB uses lowercase 'h'
+            "Nephrology":            "Pediatric Nephrology",
+            "Gastroenterology":      "Pediatric Gastroenterology",
+            "Rheumatology":          "Pediatric Rheumatology",
+            "Allergy & Immunology":  "Pediatric Allergy & Immunology",
+            "General Surgery":       "Pediatric surgery",             # DB uses lowercase 's'
+            "General Pediatrics":    "General Pediatrics",
+            "Internal Medicine":     "General Pediatrics",
+            "Family Medicine":       "General Pediatrics",
+            "Dental Services":       "Pedodontic",
         }
         ped_additions = []
         for c in candidates:
             if c in ped_map:
                 ped_additions.append(ped_map[c])
+        # When the patient explicitly asked for pediatrics, drop the adult
+        # variants whose pediatric counterpart was added — otherwise the LLM
+        # routing stage may still pick the adult specialty from the candidate
+        # list and ignore the qualifier ("اطفال غدد" → Endocrinology).
+        if explicit_pediatric:
+            if ped_additions:
+                adult_to_drop = {k for k, v in ped_map.items() if v in ped_additions}
+                candidates = [c for c in candidates if c not in adult_to_drop]
+            else:
+                # No body-system match yielded a pediatric counterpart — bias
+                # toward General Pediatrics so the request never routes to an
+                # adult specialty.
+                ped_additions = ["General Pediatrics"]
         candidates = list(dict.fromkeys(ped_additions + candidates))  # dedupe, peds first
 
     # Filter out non-bookable
     candidates = [c for c in candidates if c not in NON_BOOKABLE]
 
     return candidates
+
+
+_PEDIATRIC_MARKERS_EN = ("pediatric", "paediatric", "peds", "child", "children", "kid", "kids", "infant", "baby", "newborn")
+_PEDIATRIC_MARKERS_AR_NORM = ("اطفال", "طفل", "رضيع", "مولود", "طفله")
+
+
+def _mentions_pediatric(text: str) -> bool:
+    """True if the patient's text explicitly references pediatrics (vs only
+    referencing a body system / specialty for an adult)."""
+    if not text:
+        return False
+    lo = text.lower()
+    if any(m in lo for m in _PEDIATRIC_MARKERS_EN):
+        return True
+    norm = normalize_ar(text)
+    return any(m in norm for m in _PEDIATRIC_MARKERS_AR_NORM)
 
 
 def _get_ar_names(en_candidates: list) -> list:

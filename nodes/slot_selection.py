@@ -43,6 +43,17 @@ def slot_selection_node(state: BookingState) -> BookingState:
     if state.pop("_skip_time_preference_this_turn", False):
         return state
 
+    # ── Safety net: "who's available today" → re-show the doctor list ──
+    # When the patient has a doctor selected but explicitly asks WHO is
+    # available, that's a request to reset the choice and see all options
+    # again — not a time/slot intent. Without this, the slot-selection logic
+    # keeps proposing the same fallback time and the conversation loops.
+    if state.get("doctor") and stage in ("slot_selection", "patient_info"):
+        from nodes._helpers import get_last_user_message
+        msg = (get_last_user_message(state) or "").strip()
+        if _is_who_is_available_request(msg):
+            return _reshow_doctor_list_for_date(state, msg, lang)
+
     # Must be in an active booking with a doctor to do anything here
     if not state.get("doctor"):
         return state
@@ -260,7 +271,7 @@ def _handle_time_preference(preferred_raw: str, state: dict, lang: str) -> str:
     target = parse_time_preference(preferred_raw)
     if not target:
         return (
-            "ما فهمت الوقت، ممكن توضح أكتر؟"
+            "ما فهمت الوقت، ممكن توضح أكثر؟"
             if lang == "ar"
             else "I didn't catch the time — could you clarify?"
         )
@@ -370,6 +381,18 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
     state["available_slots"] = slots
 
     if not slots:
+        # Before falling back to "try another date", surface other loaded
+        # doctors in the same specialty so the patient has a concrete next
+        # step. Mirrors the same dead-end fallback in doctor_selection_node.
+        from nodes.doctor_selection import _other_doctors_with_availability
+        others = _other_doctors_with_availability(state)
+        if others:
+            from services.formatter import no_slots_with_alternatives_message
+            state["_alternatives_offered"] = True
+            return no_slots_with_alternatives_message(
+                state.get("doctor", ""), state.get("doctor_ar", ""),
+                others, lang,
+            )
         date_label = format_date(used_date, lang)
         if lang == "ar":
             return f"للأسف ما في مواعيد في {date_label}. تبغى أجرب يوم ثاني؟"
@@ -377,10 +400,159 @@ def _handle_slot_fetch(state: dict, lang: str, preferred_date: str = None) -> st
 
     slot_info = get_initial_slots(slots)
     state["booking_stage"] = "slot_selection"
+
+    # Mark the displayed slot as a proposal so a follow-up "نعم" / "yes" can
+    # confirm it through the auto-accept path in slot_selection_node — without
+    # this, the patient sees "هل يناسبك؟" but acceptance has nothing to lock.
+    # Mirrors the proposal setup in doctor_selection._handle_slot_fetch.
+    first_time = slot_info["first_time"]
+    state["_proposed_slot"] = {
+        "time_24": first_time.strftime("%H:%M"),
+        "time_display": format_time(first_time, lang),
+        "date": slot_info["first_date"].strftime("%Y-%m-%d"),
+        "date_display": format_date(slot_info["first_date"], lang),
+    }
+    state["_proposal_shown_this_turn"] = True
+
+    # When the date the patient asked for has no slots and the search rolled
+    # forward, surface other doctors with same-day availability — same logic
+    # as doctor_selection._handle_slot_fetch. Without this, a mid-flow "اليوم"
+    # request just keeps proposing tomorrow with no other path forward.
+    state["_alternatives_offered"] = False
+    target_for_alternatives = date_to_use
+    if (
+        target_for_alternatives
+        and used_date
+        and target_for_alternatives != used_date
+    ):
+        from nodes.doctor_selection import _find_same_day_alternatives
+        alternatives = _find_same_day_alternatives(
+            state,
+            target_date=target_for_alternatives,
+            exclude_doctor=state.get("doctor", ""),
+        )
+        if alternatives:
+            from services.formatter import slot_with_alternatives_message
+            state["_alternatives_offered"] = True
+            existing = state.get("available_doctors") or []
+            existing_keys = {
+                (d.get("Doctor", "") or "").strip().lower() for d in existing
+            }
+            for alt in alternatives:
+                key = (alt.get("Doctor", "") or "").strip().lower()
+                if key and key not in existing_keys:
+                    existing.append(alt)
+                    existing_keys.add(key)
+            state["available_doctors"] = existing
+            return slot_with_alternatives_message(
+                state["doctor"], state.get("doctor_ar", ""),
+                slot_info, alternatives, target_for_alternatives, lang,
+            )
+
     fallback_prefix = _fallback_notice(explicit_requested, used_date, lang)
     return fallback_prefix + slot_question(
         state["doctor"], state.get("doctor_ar", ""), slot_info, lang,
     )
+
+
+# ── Re-list doctors when patient explicitly asks who's available ────────────
+
+# Phrases that ask for the doctor list ("who is available?" / "any other
+# doctors?") rather than a slot for the current doctor. These need to bypass
+# the time-extraction logic and re-show the list.
+_WHO_AVAILABLE_PATTERNS = (
+    # Arabic: "مين متاح", "مين عنده", "ايش الأطباء", "ايش الدكاتره", "اطباء ثانيين"
+    r"مين\s*(?:متاح|عنده|موجود|في|فيه)",
+    r"اي(?:ش)?\s*(?:الاطباء|الدكاتر|الدكاتره|الدكاترة|الاطبا|دكاتر)",
+    r"(?:اطباء|دكاتره|دكاترة)\s*(?:تاني|ثاني|ثانيين|متاحين|متوفرين)",
+    r"دكتور\s*(?:تاني|ثاني|آخر|ثانى)",
+    r"(?:احد|واحد)\s*ثاني",
+    # English
+    r"\bwho(?:'?s|\s+is)\s+available\b",
+    r"\bany\s+(?:other|another)\s+doctor",
+    r"\bother\s+doctors?\b",
+    r"\bdifferent\s+doctor\b",
+    r"\bshow\s+(?:me\s+)?(?:the\s+)?(?:other|all|available)\s+doctors?",
+)
+
+
+def _is_who_is_available_request(text: str) -> bool:
+    if not text:
+        return False
+    from utils.language import normalize_ar
+    t = normalize_ar(text).lower()
+    return any(re.search(p, t, re.IGNORECASE) for p in _WHO_AVAILABLE_PATTERNS)
+
+
+def _reshow_doctor_list_for_date(state: dict, raw_msg: str, lang: str):
+    """Reset the current doctor pick and show the doctor list — honouring any
+    date the patient mentioned in the same message ('مين متاح اليوم' → today,
+    'مين متاح بكره' → tomorrow, otherwise keep state['date'])."""
+    from utils.datetime_fmt import resolve_relative_date, _ISO_DATE_RE
+    from services.doctor_selector import fetch_doctors
+    from services.formatter import (
+        doctor_list_message, no_doctors_on_date_message,
+    )
+
+    specialty = state.get("speciality") or state.get("speciality_ar") or ""
+
+    # Pull the date out of the same message if any. resolve_relative_date
+    # falls back to the input as-is when no relative date keyword is found.
+    resolved = resolve_relative_date(raw_msg)
+    target_date = resolved if _ISO_DATE_RE.match(resolved) else state.get("date")
+
+    # Clear doctor + slot selection so the existing doctor_list flow can take
+    # over from the next user message ("1" / "Dr. X").
+    state["doctor"] = None
+    state["doctor_ar"] = None
+    state["available_slots"] = []
+    state["selected_slot"] = None
+    state["_proposed_slot"] = None
+    state["_proposal_shown_this_turn"] = False
+    state["_alternatives_offered"] = False
+    state["walk_in_price"] = None
+    state["_walk_in_price_doctor"] = None
+
+    if not specialty:
+        # Without a specialty (Path C: doctor was looked up by name directly)
+        # we have nothing to re-list. Tell the patient and keep the doctor
+        # cleared so they can re-state who they want.
+        if lang == "ar":
+            state["last_bot_message"] = (
+                "ممكن تقولي التخصص اللي تبغاه عشان أعرض لك الأطباء المتاحين؟"
+            )
+        else:
+            state["last_bot_message"] = (
+                "Could you tell me the specialty so I can show you the available doctors?"
+            )
+        state["booking_stage"] = "complaint"
+        return state
+
+    # Strict on the requested date: the patient is explicitly asking who is
+    # available on that day — don't silently roll forward.
+    strict = bool(target_date and _ISO_DATE_RE.match(target_date or ""))
+    doctors, used_date = fetch_doctors(
+        specialty, lang, target_date, strict_date=strict,
+    )
+    state["date"] = used_date
+    state["available_doctors"] = doctors
+    state["booking_stage"] = "doctor_list"
+    if doctors:
+        state["last_bot_message"] = doctor_list_message(
+            doctors, specialty, lang, used_date,
+        )
+        from nodes.doctor_selection import auto_select_if_single_doctor
+        auto_select_if_single_doctor(state, doctors)
+    elif strict:
+        state["last_bot_message"] = no_doctors_on_date_message(
+            specialty, target_date, lang,
+        )
+    else:
+        if lang == "ar":
+            state["last_bot_message"] = "للأسف ما في أطباء متاحين حالياً. تبغى تجرب يوم ثاني؟"
+        else:
+            state["last_bot_message"] = "No doctors available right now. Want to try another date?"
+    return state
 
 
 # ── Safety net: catch slot requests the LLM missed ──────────────────────────
