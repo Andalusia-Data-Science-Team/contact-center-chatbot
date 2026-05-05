@@ -113,12 +113,19 @@ def slot_selection_node(state: BookingState) -> BookingState:
         # day. Otherwise the patient sees today's evening slots when they meant
         # tomorrow's.
         new_date = state.get("requested_date")
+        date_rollforward_prefix = ""
         if new_date and new_date != state.get("date") and state.get("doctor"):
             state["selected_slot"] = None
             state["_proposed_slot"] = None
             _handle_slot_fetch(state, lang, preferred_date=new_date)
             # _handle_slot_fetch repopulates state["available_slots"] / state["date"];
-            # fall through to filter the new list.
+            # if the requested day had no openings and the search rolled forward,
+            # surface that explicitly so the patient isn't silently shown a
+            # different day's slots.
+            from nodes.doctor_selection import _fallback_notice
+            date_rollforward_prefix = _fallback_notice(
+                new_date, state.get("date"), lang,
+            )
 
         filter_text = updates.get("slots_filter") or ""
         time_filter = parse_time_filter(filter_text) if filter_text else {"start": None, "end": None, "label": ""}
@@ -152,7 +159,7 @@ def slot_selection_node(state: BookingState) -> BookingState:
             # patient is looking at — clear it so a later acceptance doesn't
             # silently lock the stale slot.
             state["_proposed_slot"] = None
-            state["last_bot_message"] = more_slots_message(
+            state["last_bot_message"] = date_rollforward_prefix + more_slots_message(
                 state["doctor"], state.get("doctor_ar", ""), all_slots, lang,
                 filter_label=filter_label,
             )
