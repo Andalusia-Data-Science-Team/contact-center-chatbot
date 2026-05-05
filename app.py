@@ -2,12 +2,40 @@
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file before anything else
 
+import threading
+
 import streamlit as st
 from state import initial_state
 from graph import compiled_graph
 from config.settings import VIEW_MODE, LLM_INPUT_PRICE_PER_M, LLM_OUTPUT_PRICE_PER_M
 from llm.client import reset_turn_metrics, get_turn_metrics
 from db.logger import create_session, log_turn
+
+
+def _warm_crm_cache_once() -> None:
+    """Pre-warm the Dynamics CRM doctor-price cache in a background thread.
+
+    First-call latency on the CRM lookup is high (Azure AD token acquire +
+    encrypted TDS handshake to Dynamics) — running it before any user types
+    means the first booking turn isn't blocked on it. Module-level guard
+    means Streamlit script reruns can't spawn duplicate warm-up threads.
+    """
+    if getattr(_warm_crm_cache_once, "_started", False):
+        return
+    _warm_crm_cache_once._started = True
+
+    def _warm() -> None:
+        try:
+            from services.doctor_price import _get_indexes
+            _get_indexes()
+            print("[startup] CRM doctor-price cache warmed")
+        except Exception as e:
+            print(f"[startup] CRM warm-up failed: {e}")
+
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+_warm_crm_cache_once()
 
 
 # ── Page Config ─────────────────────────────────────────────────────────────

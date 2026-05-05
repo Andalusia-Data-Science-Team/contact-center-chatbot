@@ -3,6 +3,8 @@
 Fetch doctors from DB and fuzzy-match patient input to a doctor name.
 """
 import re
+import time
+from threading import Lock
 from typing import Optional
 from db.database import (
     query_availability_with_fallback,
@@ -17,6 +19,42 @@ NAME_STOPWORDS = {
     "you", "yes", "okay", "ok", "sure", "like", "a", "an", "appointment", "would",
     "دكتور", "الدكتور", "د.", "د", "مع", "أريد", "ممكن", "أبغى", "ابغى", "حجز", "موعد",
 }
+
+
+# Short-TTL shared cache for doctor lookups. Two patients asking for the same
+# specialty within 30s share a single round-trip through the heavy SQL_QUERY
+# (which builds 7 temp tables and can fan out across 8 days when the requested
+# day is empty). Thread-safe so it's correct under Streamlit's concurrent
+# session model. 30s is short enough that newly-booked slots aren't stale to
+# the second patient for long.
+_DOCTOR_CACHE_TTL_SECONDS = 30
+_DOCTOR_CACHE_MAX_ENTRIES = 200
+_doctor_cache: dict = {}
+_doctor_cache_lock = Lock()
+
+
+def _doctor_cache_get(key: tuple):
+    now = time.time()
+    with _doctor_cache_lock:
+        entry = _doctor_cache.get(key)
+        if not entry:
+            return None
+        entry_time, doctors, used_date = entry
+        if now - entry_time >= _DOCTOR_CACHE_TTL_SECONDS:
+            return None
+        # Return a shallow copy of the list — callers (e.g. _handle_slot_fetch)
+        # mutate `available_doctors` in place when surfacing alternatives.
+        return list(doctors), used_date
+
+
+def _doctor_cache_put(key: tuple, doctors: list, used_date: str) -> None:
+    with _doctor_cache_lock:
+        _doctor_cache[key] = (time.time(), doctors, used_date)
+        if len(_doctor_cache) > _DOCTOR_CACHE_MAX_ENTRIES:
+            # Drop the 20% oldest entries so the dict can't grow unbounded.
+            stale = sorted(_doctor_cache.items(), key=lambda kv: kv[1][0])
+            for k, _ in stale[: _DOCTOR_CACHE_MAX_ENTRIES // 5]:
+                _doctor_cache.pop(k, None)
 
 
 def fetch_doctors(
@@ -35,6 +73,11 @@ def fetch_doctors(
     specific day ("اليوم", "يوم الخميس") so we don't silently shift to a later
     day they didn't ask about.
     """
+    cache_key = (specialty or "", lang, preferred_date or "", bool(strict_date))
+    cached = _doctor_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     max_days = 0 if strict_date else 7
     # Always try EN first (routing returns EN names)
     rows, used_date = query_availability_with_fallback(
@@ -88,7 +131,10 @@ def fetch_doctors(
             doctors = [d for d in doctors if _to_date(d.get("Nearest_Date")) == anchor]
 
     enrich_doctors_with_prices(doctors)
-    return doctors, used_date
+    _doctor_cache_put(cache_key, doctors, used_date)
+    # Hand callers a fresh list so their in-place mutations (e.g. appending
+    # alternative doctors in _handle_slot_fetch) don't poison the cache.
+    return list(doctors), used_date
 
 
 def fetch_slots(doctor_en: str, doctor_ar: str = None, preferred_date: str = None) -> tuple:

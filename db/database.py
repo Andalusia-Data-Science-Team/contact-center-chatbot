@@ -1,9 +1,19 @@
 import pyodbc
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from queue import Empty, Full, Queue
 from config.settings import DB_DRIVER, DB_SERVER, DB_DATABASE, DB_USERNAME, DB_PASSWORD
 
 
-def get_connection():
+# Thread-safe connection pool. Streamlit serves each user session in its own
+# thread, so multiple concurrent users share the pool — each query borrows a
+# connection, runs, and returns it. The TLS+auth handshake to SQL Server is
+# ~100-500ms; without pooling, every DB call paid that cost.
+_POOL_MAX_SIZE = 10
+_pool: "Queue[pyodbc.Connection]" = Queue(maxsize=_POOL_MAX_SIZE)
+
+
+def _new_connection() -> pyodbc.Connection:
     conn_str = (
         f"DRIVER={{{DB_DRIVER}}};"
         f"SERVER={DB_SERVER};"
@@ -12,6 +22,44 @@ def get_connection():
         f"PWD={DB_PASSWORD};"
     )
     return pyodbc.connect(conn_str, timeout=15)
+
+
+def get_connection() -> pyodbc.Connection:
+    """Open a fresh (unpooled) connection. Kept for any legacy caller — new
+    code should use the `_borrow_conn` context manager below to share the
+    pooled connections."""
+    return _new_connection()
+
+
+@contextmanager
+def _borrow_conn():
+    """Borrow a pooled connection for the duration of the `with` block.
+
+    On exit, the connection is returned to the pool (or closed if the pool is
+    full). On exception, the connection is closed rather than returned —
+    pyodbc state after a failed query is not safe to reuse.
+    """
+    try:
+        conn = _pool.get_nowait()
+    except Empty:
+        conn = _new_connection()
+
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+    try:
+        _pool.put_nowait(conn)
+    except Full:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 SQL_QUERY = """
@@ -187,15 +235,14 @@ def query_availability(
     doctor_en: str = None,
     doctor_ar: str = None,
 ) -> list:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(SQL_QUERY, (report_date, specialty_ar, specialty_en, doctor_ar, doctor_en))
-        columns = [col[0] for col in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
-    finally:
-        cursor.close()
-        conn.close()
+    with _borrow_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_QUERY, (report_date, specialty_ar, specialty_en, doctor_ar, doctor_en))
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
 
 
 def query_availability_with_fallback(
@@ -241,15 +288,14 @@ def query_doctor_slots(
     doctor_en: str = None,
     doctor_ar: str = None,
 ) -> list:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(SLOTS_QUERY, (doctor_en, doctor_ar, report_date))
-        columns = [col[0] for col in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
-    finally:
-        cursor.close()
-        conn.close()
+    with _borrow_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SLOTS_QUERY, (doctor_en, doctor_ar, report_date))
+            columns = [col[0] for col in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
 
 
 def query_doctor_slots_with_fallback(
