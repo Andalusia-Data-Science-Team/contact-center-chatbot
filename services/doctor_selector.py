@@ -4,6 +4,7 @@ Fetch doctors from DB and fuzzy-match patient input to a doctor name.
 """
 import re
 import time
+from datetime import date as _date
 from threading import Lock
 from typing import Optional
 from db.database import (
@@ -100,8 +101,6 @@ def fetch_doctors(
     # date (e.g. data inconsistency), drop it instead of letting the header
     # label and per-doctor times disagree.
     if doctors:
-        from datetime import date as _date
-
         def _to_date(nd):
             if hasattr(nd, "isoformat"):  # datetime.date
                 return nd if not hasattr(nd, "hour") else nd.date()

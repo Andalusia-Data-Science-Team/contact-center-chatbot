@@ -4,6 +4,7 @@ Shared utilities for LangGraph nodes.
 Centralizes state update logic so every node applies updates consistently.
 """
 import re
+from datetime import date as _date
 
 from utils.datetime_fmt import resolve_relative_date
 from utils.language import normalize_ar
@@ -73,7 +74,6 @@ def apply_llm_updates(state: dict, updates: dict) -> None:
     # the LLM sometimes hallucinates requested_date="today" when the user only
     # gave a time-of-day hint like "العصر". Require the current user message
     # to actually mention "today/اليوم/etc." to honour a regression.
-    from datetime import date as _date
     new_rd = updates.get("requested_date")
     if new_rd is not None and new_rd not in ("null", ""):
         resolved = resolve_relative_date(new_rd)

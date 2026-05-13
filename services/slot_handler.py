@@ -2,10 +2,12 @@
 """
 Parse patient's time preference and find nearest available slot.
 """
+import re
 from datetime import datetime
 from typing import Optional
 from llm.client import call_llm
 from prompts.routing import TIME_PARSE_PROMPT
+from utils.language import to_ascii_digits
 
 
 def parse_time_preference(raw: str) -> Optional[datetime.time]:
@@ -40,8 +42,6 @@ def _try_direct_parse(raw: str) -> Optional[datetime.time]:
     For ambiguous times without AM/PM (e.g. '3:00', '3'), assume PM in hospital context
     since appointments are virtually never at 1-7 AM.
     """
-    import re
-    from utils.language import to_ascii_digits
     text = to_ascii_digits(raw).strip().lower()
 
     # Normalise Arabic period suffixes to canonical am/pm BEFORE the regex stage.
@@ -229,7 +229,6 @@ def parse_time_filter(raw: str) -> dict:
       - "after X" / "before X" / "بعد X"
     Returns: {"start": time|None, "end": time|None, "label": str}
     """
-    import re
     text = raw.strip().lower()
 
     # Check named periods (longest match first)

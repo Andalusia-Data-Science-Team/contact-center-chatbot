@@ -20,6 +20,7 @@ import re
 
 from langgraph.graph import StateGraph, END
 from state import BookingState
+from config.settings import LANGGRAPH_CHECKPOINTER
 from nodes.language import language_node
 from nodes.emergency import emergency_node
 from nodes.intent import intent_node
@@ -160,6 +161,55 @@ def route_after_intent(state: BookingState) -> str:
     return "non_booking_response"
 
 
+# Cap on in-memory message history. SQLite logging is independent of this —
+# full audit history lives in `chat_logs`. The cap exists to keep long-lived
+# sessions (especially the future WhatsApp deployment, where sessions can
+# span days) from growing unbounded in memory. 50 entries ≈ 25 turns, which
+# comfortably covers conversation_node's messages[-14:] slice and the
+# repetition-detection scan in this file.
+MAX_MESSAGES_RETAINED = 50
+
+
+def _trim_messages(state: BookingState) -> None:
+    """Cap state['messages'] to the most recent MAX_MESSAGES_RETAINED entries.
+
+    Called from `_safety_net` once per turn. No-op when the list is at or
+    below the cap. The SQLite `chat_logs` table is the source of truth for
+    audit history; the in-memory list only needs enough context for the
+    conversation LLM (14) and the repetition detector (recent assistants).
+    """
+    msgs = state.get("messages") or []
+    if len(msgs) > MAX_MESSAGES_RETAINED:
+        state["messages"] = msgs[-MAX_MESSAGES_RETAINED:]
+
+
+def _clear_transient_fields(state: BookingState) -> None:
+    """Null out per-turn-only state fields at end of every turn.
+
+    Centralises the cleanup so future contributors don't have to grep across
+    nodes to find what's cleared and what persists. Each entry below is a
+    *per-turn* flag that should NOT survive into the next user message.
+
+    Multi-turn state fields are intentionally NOT cleared here:
+      - `_proposed_slot`        — set in turn N, consumed in N+1 (acceptance)
+      - `_alternatives_offered` — gates doctor switching across turns
+      - `_single_doctor_choice_pending` — flag from end-of-turn N to start of N+1
+      - `_partial_doctor_name` / `_partial_doctor_attempts` — escalation memory
+      - `_walk_in_price_doctor` / `_pending_price_followup` — multi-turn cache
+    Touch those only if you also update their consumers.
+    """
+    # Raw LLM updates dict — single-turn by design. Dropping this also kills
+    # any keys nested inside it (e.g. `_price_handled`) so they don't need
+    # separate clearing.
+    state["_llm_updates"] = None
+    # "I just showed the proposed slot — don't auto-confirm yet."
+    state["_proposal_shown_this_turn"] = False
+    # "Doctor was picked by bare digit; skip the slot safety net's bare-digit
+    # → time misread." Normally consumed via `state.pop` in slot_selection;
+    # cleared here too as belt-and-braces if a turn ever skips slot_selection.
+    state["_skip_time_preference_this_turn"] = False
+
+
 def _safety_net(state: BookingState) -> BookingState:
     """
     Final pass: if reply is still empty after all booking nodes,
@@ -283,17 +333,29 @@ def _safety_net(state: BookingState) -> BookingState:
             state["followup_message"], lang,
         )
 
-    # Clean up transient data (but NOT followup_message — app.py reads it after)
-    state["_llm_updates"] = None
-    # One-turn freshness flag: only the turn that shows the proposal sets it,
-    # so the NEXT turn's slot_selection treats the user message as a reply.
-    state["_proposal_shown_this_turn"] = False
+    # Bound the in-memory messages list before clearing transients. Cap
+    # prevents long-lived sessions from growing unbounded; full audit
+    # history is preserved in the SQLite `chat_logs` table.
+    _trim_messages(state)
+
+    # Clean up per-turn transient fields. `followup_message` is intentionally
+    # NOT cleared here — app.py reads it after the graph returns.
+    _clear_transient_fields(state)
     return state
 
 
 # ── Graph construction ───────────────────────────────────────────────────────
 
-def build_graph() -> StateGraph:
+# Worst-case path through the pipeline is ~9 node executions per turn
+# (language → emergency → intent → conversation → routing → doctor_selection
+# → slot_selection → patient_info → safety_net). The LangGraph default is 25;
+# setting it explicitly at invoke time documents the expected envelope and
+# makes any future cycle regression abort at a known threshold instead of
+# silently chewing CPU.
+RECURSION_LIMIT = 25
+
+
+def build_graph(checkpointer=None) -> StateGraph:
     graph = StateGraph(BookingState)
 
     # ── Shared pipeline ──
@@ -339,7 +401,20 @@ def build_graph() -> StateGraph:
     graph.add_edge("patient_info", "safety_net")
     graph.add_edge("safety_net", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer) if checkpointer else graph.compile()
 
 
-compiled_graph = build_graph()
+# Optional LangGraph checkpointer. Off by default (LANGGRAPH_CHECKPOINTER=none
+# in config.settings); flip to "memory" in `.env` to enable an in-process
+# MemorySaver. State is keyed on the `thread_id` passed via the `configurable`
+# config dict at invoke time (see app.py). This is the lever for future
+# WhatsApp / FastAPI deployment where stateless workers need to look up state
+# by session ID — flag it on once a durable backend is wired in.
+_checkpointer = None
+if LANGGRAPH_CHECKPOINTER == "memory":
+    # Lazy import — only required when the flag is on.
+    from langgraph.checkpoint.memory import MemorySaver
+    _checkpointer = MemorySaver()
+    print(f"[graph] LangGraph checkpointer enabled: memory")
+
+compiled_graph = build_graph(checkpointer=_checkpointer)

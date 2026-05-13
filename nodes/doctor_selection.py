@@ -2,6 +2,8 @@
 """
 Handles doctor matching from patient input and fetching their available slots.
 """
+from datetime import datetime
+
 from state import BookingState
 from nodes._helpers import get_last_user_message
 from services.doctor_selector import match_doctor, fetch_slots
@@ -572,7 +574,6 @@ def _fallback_notice(requested: str, used_date: str, lang: str) -> str:
     if not requested or not used_date or requested == used_date:
         return ""
     try:
-        from datetime import datetime
         req_dt = datetime.strptime(requested, "%Y-%m-%d").date()
     except (ValueError, TypeError):
         return ""

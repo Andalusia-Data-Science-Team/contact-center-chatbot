@@ -122,8 +122,6 @@ def resolve_relative_date(raw: str) -> str:
     or "بكرا إن شاء الله يكون مناسباً", not just "بكرا" by itself.
     Pass through unchanged if no keyword found.
     """
-    from datetime import date, timedelta
-
     if not raw:
         return raw
 

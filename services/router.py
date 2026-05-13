@@ -9,6 +9,8 @@ Strategy:
 
 This is much more accurate than throwing 75 specialties at the LLM and hoping.
 """
+from collections import Counter
+
 from llm.client import call_llm
 from config.constants import (
     SPECIALTIES_EN, SPECIALTIES_AR,
@@ -488,8 +490,6 @@ def _keyword_prefilter(text: str, lang: str, age: int) -> list:
     collapsed) so "أذن"/"اذن" match the same key. A rapidfuzz pass also catches
     single-character typos like "تغزية"→"تغذية" or "صدع"→"صداع".
     """
-    from collections import Counter
-
     # EN: substring match on lower-cased text (text is already lowercased by caller)
     hits = Counter()
     for keyword, specs in SYMPTOM_MAP.items():

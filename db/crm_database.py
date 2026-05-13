@@ -52,6 +52,12 @@ _token_lock = threading.Lock()
 _doctor_cache: dict = {"doctors": [], "loaded_at": 0.0, "failed": False}
 _doctor_lock = threading.Lock()
 
+# Set to True after the first call to `_load_msal_cache` registers its persist
+# callback with atexit. Without this guard, every token refresh would queue
+# another copy of the same callback, and atexit would fire N copies at
+# shutdown — each writing the same cache file.
+_msal_atexit_registered = False
+
 
 def _crm_host() -> str:
     # "org2f45e702.crm4.dynamics.com,5558" → "org2f45e702.crm4.dynamics.com"
@@ -65,6 +71,7 @@ def _is_configured() -> bool:
 
 
 def _load_msal_cache(msal_mod):
+    global _msal_atexit_registered
     cache = msal_mod.SerializableTokenCache()
     try:
         if os.path.exists(_MSAL_CACHE_PATH):
@@ -82,7 +89,12 @@ def _load_msal_cache(msal_mod):
             except Exception as e:
                 print(f"[CRM] could not persist token cache: {e}")
 
-    atexit.register(_persist)
+    # Register at most once per process. `_load_msal_cache` is called from
+    # `_get_token` on every token refresh; without the guard each call queues
+    # another copy of `_persist` into atexit, leaking unboundedly.
+    if not _msal_atexit_registered:
+        atexit.register(_persist)
+        _msal_atexit_registered = True
     return cache, _persist
 
 

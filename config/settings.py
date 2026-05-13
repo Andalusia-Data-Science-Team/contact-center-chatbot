@@ -42,3 +42,53 @@ VIEW_MODE = os.getenv("VIEW_MODE", "stakeholder")
 # --- LLM Pricing (per 1M tokens, OpenRouter Llama 3.3 70B) ---
 LLM_INPUT_PRICE_PER_M = 0.90    # $0.90 per 1M input tokens
 LLM_OUTPUT_PRICE_PER_M = 0.90   # $0.90 per 1M output tokens
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production-hardening knobs (added in Stage 1.9). Every value below defaults
+# to current behavior, so an unchanged .env preserves the production flow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    """Parse a truthy/falsy env var. None → default; '0'/'false'/'no'/'off'/'' → False."""
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# --- Per-call model routing (consumed when Stage 4 item 1.1 lands) ---
+# Each label can route to a different model; all default to OPENROUTER_MODEL so
+# unchanged config keeps everything on Llama 3.3 70B exactly as today.
+OPENROUTER_MODEL_CONVERSATION = os.getenv("OPENROUTER_MODEL_CONVERSATION", OPENROUTER_MODEL)
+OPENROUTER_MODEL_ROUTING      = os.getenv("OPENROUTER_MODEL_ROUTING",      OPENROUTER_MODEL)
+OPENROUTER_MODEL_INTENT       = os.getenv("OPENROUTER_MODEL_INTENT",       OPENROUTER_MODEL)
+OPENROUTER_MODEL_TRIAGE       = os.getenv("OPENROUTER_MODEL_TRIAGE",       OPENROUTER_MODEL)
+OPENROUTER_MODEL_TIME_PARSE   = os.getenv("OPENROUTER_MODEL_TIME_PARSE",   OPENROUTER_MODEL)
+
+
+# --- Reliability / timeouts (consumed in Stage 2) ---
+LLM_TIMEOUT_SECONDS      = int(os.getenv("LLM_TIMEOUT_SECONDS",      "30"))
+DB_QUERY_TIMEOUT_SECONDS = int(os.getenv("DB_QUERY_TIMEOUT_SECONDS", "15"))
+DB_POOL_MAX_SIZE         = int(os.getenv("DB_POOL_MAX_SIZE",         "10"))
+DB_POOL_MAX_AGE_SECONDS  = int(os.getenv("DB_POOL_MAX_AGE_SECONDS",  "300"))
+
+
+# --- Logging (consumed by db/logger.py) ---
+# Empty string = use the in-repo default (db/chat_logs.db). Override to point
+# at a shared volume or an alternate filename.
+LOG_DB_PATH = os.getenv("LOG_DB_PATH", "")
+# Kill switch for the per-LLM-call ledger. Disable in extreme situations
+# (e.g. disk full) — leaves the rest of the booking flow untouched.
+LOG_LLM_CALLS = _env_bool("LOG_LLM_CALLS", True)
+
+
+# --- Feature flags (consumed in later stages) ---
+# Stage 4 item 1.2 — opt-in provider-side prompt-caching header.
+OPENROUTER_PROMPT_CACHING = _env_bool("OPENROUTER_PROMPT_CACHING", False)
+# Stage 4 item 1.3 — local response cache for intent + time_parse. Set to 0 to
+# bisect a regression after the cache lands.
+RESPONSE_CACHE_ENABLED    = _env_bool("RESPONSE_CACHE_ENABLED", True)
+# Stage 5 item 3.3 — 'memory' enables an in-memory LangGraph checkpointer;
+# 'none' (default) keeps the current Streamlit-only state model.
+LANGGRAPH_CHECKPOINTER    = os.getenv("LANGGRAPH_CHECKPOINTER", "none")

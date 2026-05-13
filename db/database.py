@@ -1,16 +1,30 @@
+import atexit
+import random
+import time
+
 import pyodbc
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from queue import Empty, Full, Queue
-from config.settings import DB_DRIVER, DB_SERVER, DB_DATABASE, DB_USERNAME, DB_PASSWORD
+from config.settings import (
+    DB_DRIVER, DB_SERVER, DB_DATABASE, DB_USERNAME, DB_PASSWORD,
+    DB_POOL_MAX_SIZE, DB_POOL_MAX_AGE_SECONDS, DB_QUERY_TIMEOUT_SECONDS,
+)
 
 
 # Thread-safe connection pool. Streamlit serves each user session in its own
 # thread, so multiple concurrent users share the pool — each query borrows a
 # connection, runs, and returns it. The TLS+auth handshake to SQL Server is
 # ~100-500ms; without pooling, every DB call paid that cost.
-_POOL_MAX_SIZE = 10
-_pool: "Queue[pyodbc.Connection]" = Queue(maxsize=_POOL_MAX_SIZE)
+#
+# Each pool entry is a (conn, created_at) tuple. On borrow, if the connection
+# is at least DB_POOL_MAX_AGE_SECONDS old it is closed and a fresh one is
+# opened in its place — pre-empts the SQL Server / firewall idle-killed
+# connection pattern that surfaces as "Communication link failure" on the
+# next query. Setting DB_POOL_MAX_AGE_SECONDS=0 effectively disables pool
+# reuse (every borrow opens a fresh connection); useful for debugging.
+_pool: "Queue[tuple[pyodbc.Connection, float]]" = Queue(maxsize=DB_POOL_MAX_SIZE)
 
 
 def _new_connection() -> pyodbc.Connection:
@@ -21,7 +35,7 @@ def _new_connection() -> pyodbc.Connection:
         f"UID={DB_USERNAME};"
         f"PWD={DB_PASSWORD};"
     )
-    return pyodbc.connect(conn_str, timeout=15)
+    return pyodbc.connect(conn_str, timeout=DB_QUERY_TIMEOUT_SECONDS)
 
 
 def get_connection() -> pyodbc.Connection:
@@ -37,12 +51,29 @@ def _borrow_conn():
 
     On exit, the connection is returned to the pool (or closed if the pool is
     full). On exception, the connection is closed rather than returned —
-    pyodbc state after a failed query is not safe to reuse.
+    pyodbc state after a failed query is not safe to reuse. If the borrowed
+    pooled connection is at or above DB_POOL_MAX_AGE_SECONDS old it's
+    proactively closed and replaced with a fresh one before the `yield`.
     """
+    conn = None
+    created_at = None
+
+    # Try to reuse a pooled connection first.
     try:
-        conn = _pool.get_nowait()
+        conn, created_at = _pool.get_nowait()
+        # Recycle if the pooled conn is at or above the max age.
+        if (time.time() - created_at) >= DB_POOL_MAX_AGE_SECONDS:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
     except Empty:
+        pass
+
+    if conn is None:
         conn = _new_connection()
+        created_at = time.time()
 
     try:
         yield conn
@@ -54,12 +85,95 @@ def _borrow_conn():
         raise
 
     try:
-        _pool.put_nowait(conn)
+        _pool.put_nowait((conn, created_at))
     except Full:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def _close_pool() -> None:
+    """Drain the connection pool at process exit. Best-effort; close failures
+    don't propagate. Registered with atexit alongside the SQLite logger's own
+    `_close_conn` (item 5.5) so the process leaves no half-open SQL Server
+    sockets in CLOSE_WAIT on shutdown."""
+    while True:
+        try:
+            conn, _ = _pool.get_nowait()
+        except Empty:
+            break
+        try:
+            conn.close()
+        except Exception as e:
+            # Best-effort: a half-dead connection shouldn't crash shutdown.
+            print(f"[db._close_pool] close failed: {e}")
+
+
+atexit.register(_close_pool)
+
+
+# ── Transient-error retry ────────────────────────────────────────────────────
+# Mirrors db/crm_database.py's pattern: classify a pyodbc.Error as transient
+# by substring-matching its message (SQLSTATE 08S01 / 08001 / 28000 surface as
+# free-form strings), retry once with a fresh borrowed connection. Bypasses
+# the pool naturally — `_borrow_conn` already drops a failed connection
+# instead of returning it, so the retry's `_borrow_conn` either gets a
+# different pooled conn or opens a fresh one.
+_TRANSIENT_DB_SUBSTRINGS = (
+    "communication link failure",
+    "tcp provider",
+    "timeout expired",
+    "connection is closed",
+    "connection reset",
+    "connection broken",
+    "connection forcibly closed",
+    "server has closed",
+    "lost connection",
+    "general network error",
+    "transport-level error",
+)
+
+
+def _is_transient_db_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(s in msg for s in _TRANSIENT_DB_SUBSTRINGS)
+
+
+def _run_with_retry(fn):
+    """Run a no-arg callable, retrying once on transient pyodbc errors.
+
+    `fn` should be a closure that opens its own connection via `_borrow_conn`
+    so each attempt gets a fresh borrow. Non-transient errors (schema, syntax,
+    bad credentials) raise immediately. The first transient failure is logged
+    best-effort to the `errors` table before the retry.
+    """
+    last_err = None
+    for attempt in range(2):
+        try:
+            return fn()
+        except pyodbc.Error as e:
+            if not _is_transient_db_error(e):
+                raise
+            last_err = e
+            if attempt == 0:
+                # Best-effort log of the first failure (lazy import so
+                # db.database stays loadable without db.logger).
+                try:
+                    from db.logger import log_error
+                    log_error(
+                        "db", e,
+                        context={"fn": getattr(fn, "__name__", "?"), "attempt": 1},
+                    )
+                except Exception:
+                    pass
+                # Jittered 1s backoff — gives the upstream a moment to recover
+                # and decorrelates retries across concurrent sessions.
+                time.sleep(max(0.0, 1.0 + random.uniform(-0.3, 0.3)))
+                continue
+            raise
+    if last_err is not None:
+        raise last_err
 
 
 SQL_QUERY = """
@@ -75,19 +189,19 @@ DECLARE @DoctorEn    NVARCHAR(100) = ?;
 DECLARE @StartOfDay DATETIME = @ReportDate;
 DECLARE @EndOfDay   DATETIME = DATEADD(DAY, 1, @ReportDate);
 
-DROP TABLE IF EXISTS #ApptAgg, #SchedIntervals, #WorkIntervals, #WorkMinutesAgg,
-                    #SlotsSummary, #RankedFreeSlots, #ActualWorkingHours;
+DROP TABLE IF EXISTS #PhysiciansForDay, #FreeSlots;
 
+-- 1) Physicians who have at least one appointment matching the specialty /
+-- doctor filter on @ReportDate. The bot only needs identity + specialty
+-- labels; we drop the prior query's TotalPatients, FirstAppt, LastAppt and
+-- the chain of derived temp tables that fed reporting metrics nothing in
+-- the conversational flow ever reads.
 SELECT ap.PhysicianID,
-       MAX(p.PhysicianEnName)       AS Doctor,
-       MAX(p.PhysicianArName)       AS DoctorAR,
-       MAX(ap.SpecialtyEnName)      AS Specialty,
-       MAX(ap.SpecialtyArName)      AS SpecialtyAR,
-       @ReportDate                  AS ApptDate,
-       COUNT(DISTINCT ap.PatientID) AS TotalPatients,
-       MIN(ap.StartDateTime)        AS FirstAppt,
-       MAX(ap.EndDateTime)          AS LastAppt
-INTO #ApptAgg
+       MAX(p.PhysicianEnName)  AS Doctor,
+       MAX(p.PhysicianArName)  AS DoctorAR,
+       MAX(ap.SpecialtyEnName) AS Specialty,
+       MAX(ap.SpecialtyArName) AS SpecialtyAR
+INTO #PhysiciansForDay
 FROM OPD.BK_Appointment ap
 INNER JOIN [OPD].[BK_PatternInstance] pl ON ap.PatternInstanceID = pl.ID
 INNER JOIN [OPD].PHS_OPDPattern p ON p.ID = pl.PatternID AND p.PhysicianID = pl.PhysicianID
@@ -100,108 +214,44 @@ WHERE ap.StartDateTime >= @StartOfDay AND ap.StartDateTime < @EndOfDay
   AND (@DoctorEn    IS NULL OR p.PhysicianEnName  = @DoctorEn)
 GROUP BY ap.PhysicianID;
 
-CREATE CLUSTERED INDEX IX_ApptAgg ON #ApptAgg (PhysicianID);
+CREATE CLUSTERED INDEX IX_PhysiciansForDay ON #PhysiciansForDay (PhysicianID);
 
-SELECT ps.PhysicianID, ps.StartDateTime, ps.EndDateTime,
-       ps.ID AS PatternInstanceID, p.AllowOverBooking
-INTO #SchedIntervals
-FROM OPD.BK_PatternInstance ps
-INNER JOIN [OPD].PHS_OPDPattern p ON p.ID = ps.PatternID AND p.PhysicianID = ps.PhysicianID
-INNER JOIN #ApptAgg a ON ps.PhysicianID = a.PhysicianID
-WHERE ps.StartDateTime >= @StartOfDay AND ps.StartDateTime < @EndOfDay
-  AND p.IsDeleted = 0
-  AND (p.EndDate IS NULL OR CONVERT(DATE, ps.StartDateTime) BETWEEN p.StartDate AND p.EndDate);
-
-CREATE CLUSTERED INDEX IX_SchedIntervals ON #SchedIntervals (PhysicianID, PatternInstanceID);
-
-SELECT a.PhysicianID, a.Doctor, a.DoctorAR, a.Specialty, a.SpecialtyAR,
-       a.ApptDate AS WorkDate, si.StartDateTime, si.EndDateTime
-INTO #WorkIntervals
-FROM #ApptAgg a INNER JOIN #SchedIntervals si ON si.PhysicianID = a.PhysicianID
-UNION ALL
-SELECT a.PhysicianID, a.Doctor, a.DoctorAR, a.Specialty, a.SpecialtyAR,
-       a.ApptDate, a.FirstAppt, a.LastAppt
-FROM #ApptAgg a LEFT JOIN #SchedIntervals si ON si.PhysicianID = a.PhysicianID
-WHERE si.PhysicianID IS NULL;
-
-CREATE CLUSTERED INDEX IX_WorkIntervals ON #WorkIntervals (PhysicianID);
-
-SELECT wi.PhysicianID,
-       MAX(wi.Doctor) AS Doctor, MAX(wi.DoctorAR) AS DoctorAR,
-       MAX(wi.Specialty) AS Specialty, MAX(wi.SpecialtyAR) AS SpecialtyAR,
-       @ReportDate AS WorkDate,
-       DATENAME(WEEKDAY, MAX(wi.WorkDate)) AS WeekDayName,
-       SUM(DATEDIFF(MINUTE, wi.StartDateTime, wi.EndDateTime)) AS TotalWorkMinutes
-INTO #WorkMinutesAgg FROM #WorkIntervals wi GROUP BY wi.PhysicianID;
-
-CREATE CLUSTERED INDEX IX_WorkMinutesAgg ON #WorkMinutesAgg (PhysicianID);
-
-SELECT pi.PhysicianID AS DRID,
-       SUM(sl.SlotUnit) AS plannedslot,
-       SUM(CASE WHEN sl.IsOverbooked = 1 THEN sl.SlotUnit ELSE 0 END) AS OverbookedSlots,
-       SUM(CASE WHEN ap.SlotID IS NOT NULL THEN sl.SlotUnit ELSE 0 END) AS ActualBookedSlots,
-       CAST(AVG(CAST(DATEDIFF(SECOND, sl.StartTime, sl.EndTime) AS FLOAT)) / 60.0 AS DECIMAL(10,2)) AS AvgSlotDurationMin
-INTO #SlotsSummary
+-- 2) Free slots on @ReportDate for those physicians. Inner-joined to
+-- #PhysiciansForDay so we never scan slots for doctors outside the filter.
+SELECT p.PhysicianID,
+       sl.StartDate,
+       sl.StartTime
+INTO #FreeSlots
 FROM opd.BK_Slot sl
-INNER JOIN #SchedIntervals pi ON sl.PatternInstanceID = pi.PatternInstanceID
-LEFT JOIN [OPD].[BK_Appointment] ap ON ap.SlotID = sl.ID AND ap.StatusID NOT IN (6,7)
-WHERE sl.StartDate = @ReportDate GROUP BY pi.PhysicianID;
+LEFT JOIN OPD.BK_Appointment ap ON sl.ID = ap.SlotID
+INNER JOIN OPD.BK_PatternInstance pl ON sl.PatternInstanceID = pl.ID
+INNER JOIN [OPD].PHS_OPDPattern p ON pl.PatternID = p.ID AND pl.PhysicianID = p.PhysicianID
+INNER JOIN #PhysiciansForDay pfd ON pfd.PhysicianID = p.PhysicianID
+WHERE ap.SlotID IS NULL
+  AND sl.StartDate = @ReportDate
+  AND (sl.StartDate > CAST(GETDATE() AS DATE)
+       OR (sl.StartDate = CAST(GETDATE() AS DATE) AND sl.StartTime >= CAST(GETDATE() AS TIME)))
+  AND p.IsDeleted = 0
+  AND (p.EndDate IS NULL OR CONVERT(DATE, pl.StartDateTime) BETWEEN p.StartDate AND p.EndDate);
 
-CREATE CLUSTERED INDEX IX_SlotsSummary ON #SlotsSummary (DRID);
+CREATE CLUSTERED INDEX IX_FreeSlots ON #FreeSlots (PhysicianID, StartDate, StartTime);
 
-WITH FreeSlotsRanked AS (
-    SELECT p.PhysicianID, sl.StartDate, sl.StartTime,
-           ROW_NUMBER() OVER (PARTITION BY p.PhysicianID ORDER BY sl.StartDate, sl.StartTime) AS rn
-    FROM opd.BK_Slot sl
-    LEFT JOIN OPD.BK_Appointment ap ON sl.ID = ap.SlotID
-    INNER JOIN OPD.BK_PatternInstance pl ON sl.PatternInstanceID = pl.ID
-    INNER JOIN [OPD].PHS_OPDPattern p ON pl.PatternID = p.ID AND pl.PhysicianID = p.PhysicianID
-    WHERE ap.SlotID IS NULL
-      AND sl.StartDate = @ReportDate
-      AND (sl.StartDate > CAST(GETDATE() AS DATE)
-           OR (sl.StartDate = CAST(GETDATE() AS DATE) AND sl.StartTime >= CAST(GETDATE() AS TIME)))
-      AND p.IsDeleted = 0
-      AND (p.EndDate IS NULL OR CONVERT(DATE, pl.StartDateTime) BETWEEN p.StartDate AND p.EndDate)
-)
-SELECT PhysicianID, StartDate, StartTime INTO #RankedFreeSlots FROM FreeSlotsRanked;
+-- Final result. LEFT JOIN preserves physicians without free slots so the
+-- Python aggregator's "drop rows with no Slot_Date" filter still applies
+-- consistently (matching the prior query's behaviour).
+SELECT pfd.Specialty,
+       pfd.SpecialtyAR,
+       pfd.Doctor,
+       pfd.DoctorAR,
+       pfd.PhysicianID,
+       fs.StartDate AS Slot_Date,
+       fs.StartTime AS Slot_Time,
+       DATEDIFF(DAY, GETDATE(), fs.StartDate) AS DaysFromToday
+FROM #PhysiciansForDay pfd
+LEFT JOIN #FreeSlots fs ON fs.PhysicianID = pfd.PhysicianID
+ORDER BY pfd.Specialty, pfd.Doctor, fs.StartDate, fs.StartTime;
 
-CREATE CLUSTERED INDEX IX_RankedFreeSlots ON #RankedFreeSlots (PhysicianID);
-
-SELECT va.PhysicianID,
-       MAX(vv.MainSpecialityEnName) AS Specialty,
-       MAX(vv.MainSpecialityArName) AS SpecialtyAR
-INTO #ActualWorkingHours
-FROM [VisitMgt].[VisitService] vs
-INNER JOIN [VisitMgt].[Visit] vv ON vs.VisitID = vv.ID
-INNER JOIN VisitMgt.VisitAppointment va ON va.VisitID = vs.VisitID
-INNER JOIN VisitMgt.Receipt r ON r.VisitID = vs.VisitID
-INNER JOIN VisitMgt.ReceiptDetails rd ON rd.ReceiptID = r.ID AND rd.VisitServiceID = vs.ID
-WHERE vv.VisitClassificationID = 1
-  AND ((vs.ClaimDate >= @StartOfDay AND vs.ClaimDate < @EndOfDay)
-       OR (vs.ClaimDate IS NULL AND vs.CreatedDate >= @StartOfDay AND vs.CreatedDate < @EndOfDay))
-  AND vs.IsDeleted = 0 AND vv.VisitStatusID != 3
-GROUP BY va.PhysicianID;
-
-CREATE CLUSTERED INDEX IX_ActualWorkingHours ON #ActualWorkingHours (PhysicianID);
-
-SELECT ISNULL(ca.Specialty, awh.Specialty)   AS Specialty,
-       ISNULL(ca.SpecialtyAR, awh.SpecialtyAR) AS SpecialtyAR,
-       ca.Doctor, ca.DoctorAR, ca.WorkDate, ca.PhysicianID,
-       sl.AvgSlotDurationMin AS [Avg Slot Duration (Min.)],
-       sl.plannedslot, sl.OverbookedSlots,
-       (sl.plannedslot - sl.OverbookedSlots) AS PlannedSlots_without_overbooking,
-       sl.ActualBookedSlots,
-       rfs.StartDate AS Slot_Date, rfs.StartTime AS Slot_Time,
-       DATEDIFF(DAY, GETDATE(), rfs.StartDate) AS DaysFromToday
-FROM #WorkMinutesAgg ca
-LEFT JOIN #ApptAgg a ON a.PhysicianID = ca.PhysicianID
-LEFT JOIN #SlotsSummary sl ON sl.DRID = ca.PhysicianID
-LEFT JOIN #RankedFreeSlots rfs ON rfs.PhysicianID = ca.PhysicianID
-LEFT JOIN #ActualWorkingHours awh ON awh.PhysicianID = ca.PhysicianID
-ORDER BY ISNULL(ca.Specialty, awh.Specialty), ca.Doctor, rfs.StartDate, rfs.StartTime;
-
-DROP TABLE IF EXISTS #ApptAgg, #SchedIntervals, #WorkIntervals, #WorkMinutesAgg,
-                    #SlotsSummary, #RankedFreeSlots, #ActualWorkingHours;
+DROP TABLE IF EXISTS #PhysiciansForDay, #FreeSlots;
 """
 
 SLOTS_QUERY = """
@@ -235,14 +285,16 @@ def query_availability(
     doctor_en: str = None,
     doctor_ar: str = None,
 ) -> list:
-    with _borrow_conn() as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SQL_QUERY, (report_date, specialty_ar, specialty_en, doctor_ar, doctor_en))
-            columns = [col[0] for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        finally:
-            cursor.close()
+    def _do_query_availability():
+        with _borrow_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(SQL_QUERY, (report_date, specialty_ar, specialty_en, doctor_ar, doctor_en))
+                columns = [col[0] for col in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            finally:
+                cursor.close()
+    return _run_with_retry(_do_query_availability)
 
 
 def query_availability_with_fallback(
@@ -288,14 +340,16 @@ def query_doctor_slots(
     doctor_en: str = None,
     doctor_ar: str = None,
 ) -> list:
-    with _borrow_conn() as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SLOTS_QUERY, (doctor_en, doctor_ar, report_date))
-            columns = [col[0] for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        finally:
-            cursor.close()
+    def _do_query_doctor_slots():
+        with _borrow_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(SLOTS_QUERY, (doctor_en, doctor_ar, report_date))
+                columns = [col[0] for col in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            finally:
+                cursor.close()
+    return _run_with_retry(_do_query_doctor_slots)
 
 
 def query_doctor_slots_with_fallback(
@@ -342,7 +396,6 @@ def _is_clinic_placeholder(doctor_en: str, doctor_ar: str) -> bool:
 
 
 def aggregate_doctor_slots(rows: list) -> list:
-    from collections import defaultdict
     doctors = defaultdict(list)
     for row in rows:
         doc = (row.get("Doctor") or "").strip()

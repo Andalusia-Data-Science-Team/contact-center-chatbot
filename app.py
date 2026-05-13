@@ -6,10 +6,10 @@ import threading
 
 import streamlit as st
 from state import initial_state
-from graph import compiled_graph
+from graph import compiled_graph, RECURSION_LIMIT
 from config.settings import VIEW_MODE, LLM_INPUT_PRICE_PER_M, LLM_OUTPUT_PRICE_PER_M
-from llm.client import reset_turn_metrics, get_turn_metrics
-from db.logger import create_session, log_turn
+from llm.client import reset_turn_metrics, get_turn_metrics, set_log_context
+from db.logger import create_session, log_turn, log_error
 
 
 def _warm_crm_cache_once() -> None:
@@ -329,9 +329,24 @@ if st.session_state.is_typing:
 
     # Reset per-turn metrics before pipeline runs
     reset_turn_metrics()
+    # Attribute every LLM call in this turn to the active session + (next) turn.
+    set_log_context(
+        st.session_state.session_id,
+        state.get("_session_turns", 0) + 1,
+    )
 
     try:
-        result = compiled_graph.invoke(state)
+        result = compiled_graph.invoke(
+            state,
+            config={
+                "recursion_limit": RECURSION_LIMIT,
+                # thread_id is harmless when no checkpointer is mounted (default).
+                # When LANGGRAPH_CHECKPOINTER=memory in `.env`, the checkpointer
+                # uses this to load/save state per session — preparing for the
+                # WhatsApp / FastAPI deployment where workers are stateless.
+                "configurable": {"thread_id": st.session_state.session_id},
+            },
+        )
         st.session_state.bot_state = result
 
         # ── Collect metrics from this turn ──
@@ -377,7 +392,43 @@ if st.session_state.is_typing:
             result["followup_message"] = None
 
     except Exception as e:
-        err_msg = f"An error occurred: {str(e)}"
+        # Log structured error for triage. `log_error` is best-effort — it
+        # captures `traceback.format_exc()` itself and swallows internal
+        # failures. The outer try/except is belt-and-braces in case anything
+        # in the diagnostics code itself goes wrong.
+        try:
+            log_error(
+                "app",
+                e,
+                session_id=st.session_state.get("session_id"),
+                turn_number=state.get("_session_turns", 0) + 1,
+                context={
+                    "user_message": (last_user_msg or "")[:300],
+                    "booking_stage": state.get("booking_stage"),
+                    "language": state.get("language"),
+                },
+            )
+        except Exception:
+            pass
+
+        # Patient-facing reply: a generic apology in their detected language.
+        # NEVER include `str(e)` — the previous version leaked DB / auth /
+        # ODBC internals to the patient's chat.
+        lang = (
+            state.get("language")
+            or st.session_state.bot_state.get("language")
+            or "en"
+        )
+        if lang == "ar":
+            err_msg = (
+                "آسفة، صار خلل بسيط من ناحيتنا. "
+                "ممكن تعيد طلبك، أو نسجل بياناتك ويتواصل معك الفريق؟"
+            )
+        else:
+            err_msg = (
+                "Sorry, something went wrong on our end. "
+                "Could you try again, or shall we have our team contact you?"
+            )
         st.session_state.chat_display.append({"role": "assistant", "content": err_msg})
 
     finally:

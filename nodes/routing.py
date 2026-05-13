@@ -177,8 +177,8 @@ def _route_and_confirm(state: BookingState, lang: str) -> BookingState:
     explicit_date = state.get("requested_date") or state.get("date")
     date_label = format_date(explicit_date, lang) if explicit_date else ""
 
-    # Show specialty in patient's language
-    from config.constants import SPECIALTY_EN_TO_AR
+    # Show specialty in patient's language (SPECIALTY_EN_TO_AR is already
+    # imported at module top).
     spec_display = SPECIALTY_EN_TO_AR.get(specialty, specialty) if lang == "ar" else specialty
 
     if lang == "ar":
